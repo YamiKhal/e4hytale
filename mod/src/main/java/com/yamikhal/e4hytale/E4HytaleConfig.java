@@ -22,6 +22,10 @@ public class E4HytaleConfig {
                     config -> config.autoStart)
             .documentation("Start sharing when a hosted world is opened to other players, or when a dedicated server starts.")
             .add()
+            .append(new KeyedCodec<>("CopyAddress", Codec.BOOLEAN), (config, value) -> config.copyAddress = value,
+                    config -> config.copyAddress)
+            .documentation("Put the address into your clipboard when a hosted world goes online.")
+            .add()
             .append(new KeyedCodec<>("HostKey", Codec.STRING), (config, value) -> config.hostKey = value,
                     config -> config.hostKey)
             .documentation("Secret that keeps your address the same. Generated on first start, never share it.")
@@ -31,6 +35,7 @@ public class E4HytaleConfig {
     private String relay = "e4h.yamikhal.com";
     private int relayPort = TunnelClient.DEFAULT_PORT;
     private boolean autoStart = true;
+    private boolean copyAddress = true;
     private String hostKey = "";
 
     public String relay() {
@@ -43,6 +48,10 @@ public class E4HytaleConfig {
 
     public boolean isAutoStart() {
         return this.autoStart;
+    }
+
+    public boolean isCopyAddress() {
+        return this.copyAddress;
     }
 
     // hex, empty until generated

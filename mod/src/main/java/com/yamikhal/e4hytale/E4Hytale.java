@@ -167,6 +167,23 @@ public final class E4Hytale extends JavaPlugin {
         HytaleServer.SCHEDULED_EXECUTOR.schedule(() -> this.startWhenBound(attemptsLeft - 1), 1, TimeUnit.SECONDS);
     }
 
+    // the player whose connection comes from this local port, i.e. who joined through that peer link (the server
+    // sees every joiner as 127.0.0.1:<port of its link>). Null while the joiner is still logging in
+    @Nullable
+    PlayerRef playerAt(int localPort) {
+        Universe universe = Universe.get();
+        if (universe == null || localPort == 0) return null;
+
+        for (PlayerRef player : universe.getPlayers()) {
+            if (player.getPacketHandler().getChannel().remoteAddress() instanceof InetSocketAddress remote
+                    && remote.getAddress().isLoopbackAddress() && remote.getPort() == localPort) {
+                return player;
+            }
+        }
+
+        return null;
+    }
+
     // messages go to the world's owner in a hosted world and to the log on a dedicated server
     void tell(Message message) {
         if (Constants.SINGLEPLAYER) {
@@ -218,8 +235,16 @@ public final class E4Hytale extends JavaPlugin {
         @Override
         public void online(String address) {
             E4Hytale.this.getLogger().at(Level.INFO).log("Online, friends can join at %s", address);
-            E4Hytale.this.tell(Message.translation("e4hytale.online")
-                    .param("address", Message.raw(address).bold(true).color("#55FF55")));
+            Message shown = Message.raw(address).bold(true).color("#55FF55");
+            if (!Constants.SINGLEPLAYER || !E4Hytale.this.config.get().isCopyAddress()) {
+                E4Hytale.this.tell(Message.translation("e4hytale.online").param("address", shown));
+                return;
+            }
+
+            // a hosted world's server runs on the owner's PC, so the address can go straight into their clipboard.
+            // Off this thread, the clipboard tool may take a moment
+            Thread.ofVirtual().start(() -> E4Hytale.this.tell(Message.translation(Clipboard.copy(address)
+                    ? "e4hytale.onlineCopied" : "e4hytale.online").param("address", shown)));
         }
 
         @Override

@@ -1,0 +1,102 @@
+$C = "../Common.ui";
+$Sounds = "../Sounds.ui";
+
+@Caption = Label {
+  Anchor: (Bottom: 6, Horizontal: 4);
+  Style: (...$C.@DefaultLabelStyle, FontSize: 13, TextColor: #96a9be, RenderUppercase: true);
+};
+
+$C.@PageOverlay {
+  LayoutMode: Middle;
+
+  $C.@DecoratedContainer {
+    Anchor: (Width: 640);
+
+    #Title {
+      $C.@Title {
+        @Text = %e4hytale.ui.title;
+      }
+    }
+
+    #Content {
+      LayoutMode: Top;
+      Padding: (Full: 20);
+
+      Label #State {
+        Anchor: (Bottom: 14, Horizontal: 4);
+        Style: (...$C.@DefaultLabelStyle, FontSize: 20, TextColor: #ffffff);
+      }
+
+      @Caption {
+        Text: %e4hytale.ui.addressCaption;
+      }
+
+      Group #AddressRow {
+        LayoutMode: Left;
+        Anchor: (Bottom: 6, Height: 38);
+
+        $C.@TextField #Address {
+          @Anchor = (Right: 8);
+          FlexWeight: 1;
+        }
+
+        $C.@TextButton #CopyButton {
+          @Sounds = $Sounds.@SaveSettings;
+          @Anchor = (Width: 120);
+          Text: %e4hytale.ui.copy;
+        }
+      }
+
+      Label #CopyHint {
+        Anchor: (Bottom: 16, Horizontal: 4);
+        Style: (...$C.@DefaultLabelStyle, FontSize: 13, TextColor: #878e9c, Wrap: true);
+      }
+
+      Label #Relay {
+        Anchor: (Bottom: 16, Horizontal: 4);
+        Style: (...$C.@DefaultLabelStyle, FontSize: 14, Wrap: true);
+      }
+
+      Label #PlayersCaption {
+        Anchor: (Bottom: 6, Horizontal: 4);
+        Style: (...$C.@DefaultLabelStyle, FontSize: 13, TextColor: #96a9be, RenderUppercase: true);
+      }
+
+      Group #Players {
+        Anchor: (Height: 140, Bottom: 16);
+        LayoutMode: TopScrolling;
+        ScrollbarStyle: $C.@DefaultScrollbarStyle;
+
+        Label #PlayerList {
+          Anchor: (Horizontal: 4);
+          Style: (...$C.@DefaultLabelStyle, FontSize: 14, TextColor: #c9d1d9, Wrap: true);
+        }
+      }
+
+      Group #Buttons {
+        LayoutMode: Center;
+        Anchor: (Height: 44);
+
+        $C.@TextButton #StartButton {
+          @Sounds = $Sounds.@SaveSettings;
+          @Anchor = (Width: 200, Right: 6);
+          Text: %e4hytale.ui.start;
+        }
+
+        $C.@SecondaryTextButton #StopButton {
+          @Sounds = $Sounds.@ButtonsCancel;
+          @Anchor = (Width: 200, Right: 6);
+          Text: %e4hytale.ui.stop;
+        }
+
+        $C.@SecondaryTextButton #CloseButton {
+          @Sounds = $Sounds.@ButtonsCancel;
+          @Anchor = (Width: 160, Left: 6);
+          Text: %e4hytale.ui.close;
+        }
+      }
+    }
+  }
+}
+
+$C.@BackButton {}

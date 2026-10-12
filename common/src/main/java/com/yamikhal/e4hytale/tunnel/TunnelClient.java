@@ -23,6 +23,7 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.channels.DatagramChannel;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -79,6 +80,7 @@ public final class TunnelClient {
     private volatile long lastHeardNanos;
     private volatile long lastPingNanos;
     private volatile long rttNanos = -1;
+    private volatile long onlineSinceNanos;
 
     public TunnelClient(String relayHost, int relayPort, byte[] hostKey, String software, InetSocketAddress target,
                         Listener listener) {
@@ -116,11 +118,14 @@ public final class TunnelClient {
         void notice(String message);
     }
 
-    public record PeerStatus(int peer, InetSocketAddress address, int localPort, long bytesIn, long bytesOut,
-                             long dropped) {}
+    // bytesIn/rateIn = from the joiner to the server, bytesOut/rateOut = from the server to the joiner. dropped =
+    // server datagrams too large for the tunnel (see PeerLink#receiveLoop)
+    public record PeerStatus(int peer, InetSocketAddress address, int localPort, long connectedSeconds, long bytesIn,
+                             long bytesOut, long rateIn, long rateOut, long dropped) {}
 
+    // onlineSeconds = time since the current address was assigned, 0 while not online
     public record Status(State state, @Nullable String address, @Nullable InetSocketAddress relay, long rttMillis,
-                         List<PeerStatus> peers) {}
+                         long onlineSeconds, List<PeerStatus> peers) {}
 
     public void start() throws IOException {
         synchronized (this.lock) {
@@ -182,14 +187,18 @@ public final class TunnelClient {
     }
 
     public Status status() {
+        long now = System.nanoTime();
         List<PeerStatus> peers = new ArrayList<>();
         for (PeerLink link : this.links.values()) {
-            peers.add(new PeerStatus(link.peer(), link.address(), link.localPort(), link.bytesIn(), link.bytesOut(),
-                    link.dropped()));
+            peers.add(new PeerStatus(link.peer(), link.address(), link.localPort(),
+                    TimeUnit.NANOSECONDS.toSeconds(now - link.opened()), link.bytesIn(), link.bytesOut(),
+                    Math.round(link.rateIn()), Math.round(link.rateOut()), link.dropped()));
         }
 
+        peers.sort(Comparator.comparingInt(PeerStatus::peer));
         long rtt = this.rttNanos < 0 ? -1 : TimeUnit.NANOSECONDS.toMillis(this.rttNanos);
-        return new Status(this.state, this.address, this.relayAddress, rtt, peers);
+        long online = this.state == State.ONLINE ? TimeUnit.NANOSECONDS.toSeconds(now - this.onlineSinceNanos) : 0;
+        return new Status(this.state, this.address, this.relayAddress, rtt, online, peers);
     }
 
     // the joiner a local port belongs to, so the server's view (127.0.0.1:port) can be mapped to the real address
@@ -235,6 +244,9 @@ public final class TunnelClient {
             }
 
             this.closeIdleLinks(now);
+            for (PeerLink link : this.links.values()) {
+                link.sample();
+            }
         } catch (RuntimeException e) {
             // a failed tick must not cancel the schedule, the next one tries again
             LOGGER.log(System.Logger.Level.WARNING, "Tunnel tick failed", e);
@@ -373,6 +385,7 @@ public final class TunnelClient {
             this.hellosSent = 0;
             this.state = State.ONLINE;
             if (changed) {
+                this.onlineSinceNanos = this.lastHeardNanos;
                 this.address = welcome.name();
                 this.listener.online(welcome.name());
             }

@@ -34,14 +34,20 @@ Background research: [../ONLINE.md](../ONLINE.md).
 
 Commands (world owner, or permission `yamikhal.e4hytale.command.e4h` on a dedicated server):
 
-- `/e4h start`
-- `/e4h stop`
-- `/e4h status`: shows the address, the relay ping and who is connected.
+- `/e4h`: opens the e4hytale panel. It shows the address in a text field (select it and press Ctrl+C), a Copy
+  button (hosted worlds), the relay ping, every player who joined through the relay (time connected, data sent and
+  received, current rates) and a Start / Stop button. It refreshes every two seconds.
+- `/e4h copy`: puts the address into your clipboard (hosted worlds).
+- `/e4h start`, `/e4h stop`.
+- `/e4h status`: the panel's information in chat, also works from a server console.
+
+When a hosted world goes online, the address is copied into your clipboard automatically (config `CopyAddress`).
 
 `mods/YamiKhal_e4hytale/config.json` keys:
 
 - `Relay`, `RelayPort`: which relay to use.
 - `AutoStart`: on opening the world, or on boot for a dedicated server.
+- `CopyAddress`: copy the address into the clipboard when a hosted world goes online.
 - `HostKey`: the secret that keeps your address. Never share it.
 
 Setting the world back to Private stops sharing. Anyone with the address can join, just like a LAN world opened to
@@ -63,13 +69,13 @@ friends. Use the world password if that matters.
    - Optional: `E4H_MAX_HOSTS`, `E4H_MAX_PEERS_PER_HOST`.
    - More are listed in `RelayConfig`.
 5. Deploy. The log should say `Relay for *.e4h... on UDP 5520 (joiners) and 5521 (hosts)`.
-6. Check health from the server:
+6. Check the counters from Coolify's Terminal for the relay (the image has no curl or wget):
 
    ```sh
-   docker exec <container> wget -qO- localhost:8080/metrics
+   java -jar /app/relay.jar metrics
    ```
 
-   Or give the service a domain in Coolify for port 8080.
+   The image's health check runs `java -jar /app/relay.jar health` every minute.
 
 The `e4h-data` volume holds `names.tsv` (host names). Losing it gives every host a new address.
 

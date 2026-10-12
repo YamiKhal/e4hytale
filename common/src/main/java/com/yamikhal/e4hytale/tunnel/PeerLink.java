@@ -21,8 +21,14 @@ final class PeerLink {
     private final AtomicLong bytesIn = new AtomicLong();
     private final AtomicLong bytesOut = new AtomicLong();
     private final AtomicLong dropped = new AtomicLong();
-    private volatile long lastActive = System.nanoTime();
+    private final long opened = System.nanoTime();
+    private volatile long lastActive = this.opened;
     private volatile InetSocketAddress address;
+    // bytes per second, smoothed over a few seconds (see sample)
+    private volatile double rateIn;
+    private volatile double rateOut;
+    private long sampledIn;
+    private long sampledOut;
 
     PeerLink(TunnelClient client, int peer, InetSocketAddress target, InetSocketAddress address) throws IOException {
         this.client = client;
@@ -62,6 +68,28 @@ final class PeerLink {
 
     long lastActive() {
         return this.lastActive;
+    }
+
+    long opened() {
+        return this.opened;
+    }
+
+    double rateIn() {
+        return this.rateIn;
+    }
+
+    double rateOut() {
+        return this.rateOut;
+    }
+
+    // called once a second by the tunnel's timer, the only caller
+    void sample() {
+        long in = this.bytesIn.get();
+        long out = this.bytesOut.get();
+        this.rateIn = this.rateIn * 0.5 + (in - this.sampledIn) * 0.5;
+        this.rateOut = this.rateOut * 0.5 + (out - this.sampledOut) * 0.5;
+        this.sampledIn = in;
+        this.sampledOut = out;
     }
 
     int localPort() {

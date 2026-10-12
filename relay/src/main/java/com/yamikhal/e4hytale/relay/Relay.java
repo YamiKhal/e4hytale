@@ -1,6 +1,11 @@
 package com.yamikhal.e4hytale.relay;
 
 import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.time.Instant;
 
 // entry point of the relay app. Configured through E4H_* environment variables (see RelayConfig), stops cleanly on
@@ -13,6 +18,11 @@ public final class Relay {
 
     public static void main(String[] args) throws IOException, InterruptedException {
         RelayConfig config = RelayConfig.fromEnvironment(System.getenv());
+        if (args.length > 0) {
+            System.exit(query(config, args[0]));
+            return;
+        }
+
         NameRegistry registry = new NameRegistry(config.dataDirectory().resolve("names.tsv"), config.nameExpiry());
         registry.load(Instant.now());
 
@@ -36,5 +46,25 @@ public final class Relay {
             }
         }));
         loop.join();
+    }
+
+    // `metrics` or `health` against the running relay's status port, for the container's shell and health check
+    // (the image has no curl or wget). Exit code 0 when the relay answered
+    private static int query(RelayConfig config, String what) throws InterruptedException {
+        if (!what.equals("metrics") && !what.equals("health")) {
+            System.err.println("Usage: java -jar relay.jar [metrics | health]");
+            return 2;
+        }
+
+        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build()) {
+            HttpRequest request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + config.httpPort() + "/" + what))
+                    .timeout(Duration.ofSeconds(3)).build();
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            System.out.print(response.body());
+            return response.statusCode() == 200 ? 0 : 1;
+        } catch (IOException e) {
+            System.err.println("The relay does not answer on port " + config.httpPort() + ": " + e.getMessage());
+            return 1;
+        }
     }
 }
