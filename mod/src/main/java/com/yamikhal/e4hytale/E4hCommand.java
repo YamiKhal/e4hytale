@@ -47,10 +47,15 @@ final class E4hCommand extends AbstractPlayerCommand {
         }
     }
 
+    // what lets a player control e4hytale on a dedicated server
+    static String permission(E4Hytale plugin) {
+        return plugin.getBasePermission() + ".command.e4h";
+    }
+
     // tells the sender off when they may not control the tunnel
     private static boolean mayControl(E4Hytale plugin, CommandContext context) {
         CommandSender sender = context.sender();
-        if (plugin.mayControl(sender.getUuid(), sender.hasPermission(plugin.getBasePermission() + ".command.e4h"))) {
+        if (plugin.mayControl(sender.getUuid(), sender.hasPermission(permission(plugin)))) {
             return true;
         }
 

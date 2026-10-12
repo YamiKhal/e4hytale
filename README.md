@@ -30,7 +30,8 @@ Only the world's owner can use them. On a dedicated server they need the `yamikh
 
 ## Good to know
 
-- Anyone with the address can join, just like opening your world normally. Use a world password if that matters.
+- Anyone with the address can join, even if your world is set to friends only. Want to choose who gets in? Use
+  `/op self`, then `/whitelist` or `/ban`.
 - Setting the world back to Private stops sharing.
 - Your address belongs to your world's `HostKey` in `Saves/<world>/mods/YamiKhal_e4hytale/config.json`. Never share
   it.
@@ -48,3 +49,7 @@ The relay is a small Java app in `relay/`, deployed with `docker-compose.yml` (f
 ## Building
 
 `gradlew build` builds and tests everything. `gradlew :mod:deployClient` puts the mod into the game.
+
+## License
+
+[MIT](LICENSE)

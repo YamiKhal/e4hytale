@@ -1,5 +1,7 @@
 package com.yamikhal.e4hytale.relay;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -13,6 +15,7 @@ import java.time.Instant;
 public final class Relay {
 
     private static final System.Logger LOGGER = System.getLogger("e4hytale-relay");
+    private static final int MIN_ADMIN_TOKEN_LENGTH = 16;
 
     private Relay() {}
 
@@ -30,7 +33,7 @@ public final class Relay {
         Metrics metrics = new Metrics();
         RelayServer server = new RelayServer(config, registry, metrics);
         StatusServer status = config.httpPort() > 0
-                ? new StatusServer(config.httpPort(), metrics, server, System.getenv("E4H_ADMIN_TOKEN"))
+                ? new StatusServer(config.httpPort(), metrics, server, adminToken())
                 : null;
         if (status != null) {
             status.start();
@@ -51,6 +54,24 @@ public final class Relay {
             }
         }));
         loop.join();
+    }
+
+    // E4H_ADMIN_TOKEN, null when unset or blank (docker-compose.yml passes an empty one by default), which keeps
+    // POST /broadcast closed. Short tokens are refused, they could be guessed
+    @Nullable
+    private static String adminToken() {
+        String token = System.getenv("E4H_ADMIN_TOKEN");
+        if (token == null || token.isBlank()) {
+            return null;
+        }
+
+        if (token.strip().length() < MIN_ADMIN_TOKEN_LENGTH) {
+            LOGGER.log(System.Logger.Level.WARNING, "E4H_ADMIN_TOKEN is shorter than {0} characters, /broadcast stays off",
+                    String.valueOf(MIN_ADMIN_TOKEN_LENGTH));
+            return null;
+        }
+
+        return token.strip();
     }
 
     // `metrics` or `health` against the running relay's status port, for the container's shell and health check

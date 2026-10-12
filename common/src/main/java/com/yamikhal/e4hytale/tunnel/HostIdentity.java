@@ -19,16 +19,17 @@ import java.util.Arrays;
 import java.util.HexFormat;
 
 // a host's Ed25519 key pair. The relay ties the host's name to the public key, the host proves ownership by signing
-// the relay's challenge (see Frame). Stored as the 32 byte seed (RFC 8032 private key), so a config file holds one
-// short hex string. The public key is sent raw (32 bytes)
+// the relay's challenge (see Frame), and signs again to give the name up. Stored as the 32 byte seed (RFC 8032
+// private key), so a config file holds one short hex string. The public key is sent raw (32 bytes)
 public final class HostIdentity {
 
     public static final int SEED_LENGTH = 32;
     public static final int PUBLIC_KEY_LENGTH = 32;
     public static final int SIGNATURE_LENGTH = 64;
 
-    // what a registration signature covers besides nonce and cookie, so it can't be mistaken for anything else
-    private static final byte[] CONTEXT = "e4hytale register v2".getBytes(StandardCharsets.US_ASCII);
+    // what a signature covers besides its values, so a registration can't pass for a release or anything else
+    private static final byte[] REGISTER = "e4hytale register v2".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] RELEASE = "e4hytale release v2".getBytes(StandardCharsets.US_ASCII);
     // DER header of an X.509 Ed25519 public key, followed by the 32 raw key bytes (RFC 8410)
     private static final byte[] X509_PREFIX = HexFormat.of().parseHex("302a300506032b6570032100");
 
@@ -69,19 +70,37 @@ public final class HostIdentity {
         return this.publicKey.clone();
     }
 
+    // answers the relay's challenge
     public byte[] sign(long nonce, byte[] cookie) {
+        return this.sign(registration(nonce, cookie));
+    }
+
+    // gives up the name of this session (see Frame.Release)
+    public byte[] signRelease(long session) {
+        return this.sign(release(session));
+    }
+
+    // false for a wrong signature and for anything that isn't a valid key or signature at all
+    public static boolean verify(byte[] publicKey, long nonce, byte[] cookie, byte[] signature) {
+        return verify(publicKey, registration(nonce, cookie), signature);
+    }
+
+    public static boolean verifyRelease(byte[] publicKey, long session, byte[] signature) {
+        return verify(publicKey, release(session), signature);
+    }
+
+    private byte[] sign(byte[] payload) {
         try {
             Signature signature = Signature.getInstance("Ed25519");
             signature.initSign(this.privateKey);
-            signature.update(payload(nonce, cookie));
+            signature.update(payload);
             return signature.sign();
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException("Ed25519 is not available", e);
         }
     }
 
-    // false for a wrong signature and for anything that isn't a valid key or signature at all
-    public static boolean verify(byte[] publicKey, long nonce, byte[] cookie, byte[] signature) {
+    private static boolean verify(byte[] publicKey, byte[] payload, byte[] signature) {
         if (publicKey.length != PUBLIC_KEY_LENGTH || signature.length != SIGNATURE_LENGTH) {
             return false;
         }
@@ -92,7 +111,7 @@ public final class HostIdentity {
             PublicKey key = KeyFactory.getInstance("Ed25519").generatePublic(new X509EncodedKeySpec(encoded));
             Signature verifier = Signature.getInstance("Ed25519");
             verifier.initVerify(key);
-            verifier.update(payload(nonce, cookie));
+            verifier.update(payload);
             return verifier.verify(signature);
         } catch (InvalidKeySpecException | InvalidKeyException | SignatureException e) {
             return false;
@@ -101,9 +120,13 @@ public final class HostIdentity {
         }
     }
 
-    private static byte[] payload(long nonce, byte[] cookie) {
-        return ByteBuffer.allocate(CONTEXT.length + Long.BYTES + cookie.length).put(CONTEXT).putLong(nonce).put(cookie)
+    private static byte[] registration(long nonce, byte[] cookie) {
+        return ByteBuffer.allocate(REGISTER.length + Long.BYTES + cookie.length).put(REGISTER).putLong(nonce).put(cookie)
                 .array();
+    }
+
+    private static byte[] release(long session) {
+        return ByteBuffer.allocate(RELEASE.length + Long.BYTES).put(RELEASE).putLong(session).array();
     }
 
     // hands out the seed instead of random bytes, see fromSeed

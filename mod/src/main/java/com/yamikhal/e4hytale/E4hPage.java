@@ -11,6 +11,7 @@ import com.hypixel.hytale.server.core.Constants;
 import com.hypixel.hytale.server.core.HytaleServer;
 import com.hypixel.hytale.server.core.Message;
 import com.hypixel.hytale.server.core.entity.entities.player.pages.InteractiveCustomUIPage;
+import com.hypixel.hytale.server.core.permissions.PermissionsModule;
 import com.hypixel.hytale.server.core.ui.builder.EventData;
 import com.hypixel.hytale.server.core.ui.builder.UICommandBuilder;
 import com.hypixel.hytale.server.core.ui.builder.UIEventBuilder;
@@ -25,6 +26,7 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -81,6 +83,14 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
 
     @Override
     public void handleDataEvent(@Nonnull Ref<EntityStore> ref, @Nonnull Store<EntityStore> store, @Nonnull PageEvent data) {
+        // checked again on every press, the permission may be gone since the panel opened
+        UUID player = this.playerRef.getUuid();
+        boolean permitted = PermissionsModule.get().hasPermission(player, E4hCommand.permission(this.plugin));
+        if (!this.plugin.mayControl(player, permitted)) {
+            this.close();
+            return;
+        }
+
         switch (data.action) {
             case Copy -> this.copy();
             case Start -> this.plugin.startTunnel();

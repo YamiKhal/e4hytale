@@ -33,7 +33,7 @@ $C.@PageOverlay {
 
       Group #AddressRow {
         LayoutMode: Left;
-        Anchor: (Bottom: 6, Height: 38);
+        Anchor: (Bottom: 6, Height: 40);
 
         // read-only, so the address can be selected and copied but not changed by accident
         Group #AddressBox {
@@ -45,7 +45,8 @@ $C.@PageOverlay {
           CodeEditor #Address {
             FlexWeight: 1;
             Style: (TextColor: #ffffff, FontSize: 16);
-            ContentPadding: 9;
+            // small enough that one line fits the row, a taller line makes the editor scroll (and show a scrollbar)
+            ContentPadding: 6;
             IsReadOnly: true;
             ScrollbarStyle: $C.@DefaultScrollbarStyle;
           }

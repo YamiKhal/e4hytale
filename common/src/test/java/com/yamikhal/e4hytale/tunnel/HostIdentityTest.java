@@ -48,6 +48,19 @@ class HostIdentityTest {
     }
 
     @Test
+    void releasesVerifyOnlyForTheirSessionAndNeverPassForRegistrations() {
+        HostIdentity identity = HostIdentity.fromSeed(HostIdentity.newSeed());
+        byte[] release = identity.signRelease(42L);
+        assertTrue(HostIdentity.verifyRelease(identity.publicKey(), 42L, release));
+        assertFalse(HostIdentity.verifyRelease(identity.publicKey(), 43L, release));
+
+        // the two kinds of signature cover different contexts, one can't stand in for the other
+        byte[] registration = identity.sign(42L, new byte[0]);
+        assertFalse(HostIdentity.verifyRelease(identity.publicKey(), 42L, registration));
+        assertFalse(HostIdentity.verify(identity.publicKey(), 42L, new byte[0], release));
+    }
+
+    @Test
     void rejectsGarbageInsteadOfThrowing() {
         assertFalse(HostIdentity.verify(new byte[32], 1L, new byte[16], new byte[64]));
         assertFalse(HostIdentity.verify(new byte[31], 1L, new byte[16], new byte[64]));

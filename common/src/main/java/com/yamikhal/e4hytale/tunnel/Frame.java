@@ -58,9 +58,9 @@ public sealed interface Frame {
     // host -> relay, the host stops hosting
     record Goodbye(long session) implements Frame {}
 
-    // host -> relay, the host stops hosting and retires its name, before it registers with a new key. The session
-    // id proves the host owns the name's key (it signed for that session)
-    record Release(long session) implements Frame {}
+    // host -> relay, the host stops hosting and retires its name, before it registers with a new key. Signed (see
+    // HostIdentity#signRelease): someone who saw the session id may end the session, but never take the name away
+    record Release(long session, byte[] signature) implements Frame {}
 
     enum Reason {
         // the relay doesn't know the session, usually because it restarted. The host starts over

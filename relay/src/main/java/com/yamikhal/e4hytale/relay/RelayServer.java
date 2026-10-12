@@ -27,6 +27,7 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.StandardSocketOptions;
@@ -45,6 +46,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -61,13 +63,19 @@ final class RelayServer {
     private static final Duration TIMER_INTERVAL = Duration.ofSeconds(1);
     private static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(5);
     private static final Duration HOUSEKEEPING_INTERVAL = Duration.ofMinutes(1);
-    // joiners waiting for the rest of their ClientHello, more at once are refused
+    // joiners waiting for the rest of their ClientHello. When full, the oldest goes: a real joiner sends its whole
+    // ClientHello within a round trip, so only a very fast flood could push one out
     private static final int MAX_HANDSHAKES = 1024;
     private static final int MAX_HANDSHAKE_DATAGRAMS = 8;
     // largest joiner datagram passed on. Client Initials are padded to 1200 or a bit more, and a joiner's path MTU
     // probes above this would only work through IP fragmentation on the way to the host. 1400 + tunnel header still
     // fits the 1460 byte MTU of DS-Lite links
     private static final int MAX_JOINER_PAYLOAD = 1400;
+    // clients pad datagrams with Initial packets to at least this (RFC 9000 section 14.1), smaller ones are dropped
+    // so a spoofed one can't draw a larger refusal
+    private static final int MIN_INITIAL_DATAGRAM = 1200;
+    // longest software name the log shows, it comes from the host
+    private static final int MAX_LOGGED_SOFTWARE = 64;
     // server connection ids remembered per joiner, to find it again when its address changes (NAT rebinding)
     private static final int MAX_CIDS_PER_PEER = 4;
     // registrations per source address and minute (a host needs one, retries after a lost welcome reuse it)
@@ -89,7 +97,8 @@ final class RelayServer {
     private final Map<InetSocketAddress, Peer> peers = new HashMap<>();
     private final Map<ByteBuffer, Peer> peersByCid = new HashMap<>();
     private final Set<Integer> cidLengths = new HashSet<>();
-    private final Map<InetSocketAddress, Handshake> handshakes = new HashMap<>();
+    // in arrival order, see MAX_HANDSHAKES
+    private final Map<InetSocketAddress, Handshake> handshakes = new LinkedHashMap<>();
     private final RateLimiter handshakeLimiter;
     private final RateLimiter registrationLimiter = new RateLimiter(REGISTRATIONS_PER_MINUTE, Duration.ofMinutes(1));
     private final RateLimiter newNameLimiter;
@@ -212,7 +221,7 @@ final class RelayServer {
 
         if (!QuicPackets.isLongHeader(datagram)) {
             this.rebind(source, datagram, now);
-        } else if (QuicPackets.version(datagram) == InitialKeys.VERSION_1) {
+        } else if (QuicPackets.version(datagram) == InitialKeys.VERSION_1 && datagram.remaining() >= MIN_INITIAL_DATAGRAM) {
             this.handshake(source, datagram, now);
         }
     }
@@ -221,9 +230,15 @@ final class RelayServer {
     private void handshake(InetSocketAddress source, ByteBuffer datagram, long now) {
         Handshake handshake = this.handshakes.get(source);
         if (handshake == null) {
-            if (this.handshakes.size() >= MAX_HANDSHAKES || !this.handshakeLimiter.tryAcquire(source.getAddress(), now)) {
+            if (!this.handshakeLimiter.tryAcquire(source.getAddress(), now)) {
                 this.metrics.refused.incrementAndGet();
                 return;
+            }
+
+            if (this.handshakes.size() >= MAX_HANDSHAKES) {
+                Iterator<Handshake> oldest = this.handshakes.values().iterator();
+                oldest.next();
+                oldest.remove();
             }
 
             handshake = new Handshake(source, now);
@@ -238,7 +253,14 @@ final class RelayServer {
         byte[] copy = new byte[datagram.remaining()];
         datagram.duplicate().get(copy);
         handshake.datagrams.add(copy);
-        for (QuicPackets.Initial initial : QuicPackets.openClientInitials(datagram, handshake::keysFor)) {
+        List<QuicPackets.Initial> initials = QuicPackets.openClientInitials(datagram, handshake::keysFor);
+        if (initials.isEmpty() && handshake.datagrams.size() == 1) {
+            // a real joiner's first datagram always opens, so this one keeps no state
+            this.handshakes.remove(source);
+            return;
+        }
+
+        for (QuicPackets.Initial initial : initials) {
             handshake.scid = initial.scid();
             if (!QuicPackets.readCryptoFrames(initial.payload(), handshake.stream)) {
                 this.handshakes.remove(source);
@@ -311,12 +333,18 @@ final class RelayServer {
     }
 
     // a short header packet from an unknown address: a known joiner whose NAT gave it a new port. Found by the
-    // server's connection id, which the relay saw in the server's long header packets
+    // server's connection id, which the relay saw in the server's long header packets. Only within the same IP
+    // address: the game server sees the same loopback peer either way, so it can't validate the new path, and a
+    // joiner (who knows its connection ids) could otherwise point the world's traffic at any address it spoofs
     private void rebind(InetSocketAddress source, ByteBuffer datagram, long now) {
+        if (datagram.remaining() > MAX_JOINER_PAYLOAD) {
+            return;
+        }
+
         for (int length : this.cidLengths) {
             byte[] cid = QuicPackets.shortHeaderDcid(datagram, length);
             Peer peer = cid == null ? null : this.peersByCid.get(ByteBuffer.wrap(cid));
-            if (peer == null) continue;
+            if (peer == null || !peer.address.getAddress().equals(source.getAddress())) continue;
 
             this.peers.remove(peer.address);
             peer.address = source;
@@ -362,7 +390,11 @@ final class RelayServer {
         long session = sessionOf(frame);
         Host host = this.hosts.get(session);
         if (host == null) {
-            this.sendTunnel(new Reject(session, Reason.UNKNOWN_SESSION, ""), source);
+            // a goodbye is smaller than the reject, and its host is leaving anyway
+            if (!(frame instanceof Goodbye)) {
+                this.sendTunnel(new Reject(session, Reason.UNKNOWN_SESSION, ""), source);
+            }
+
             return;
         }
 
@@ -380,8 +412,10 @@ final class RelayServer {
             case Ping ping -> this.sendTunnel(new Pong(host.session, ping.nonce()), source);
             case Goodbye goodbye -> this.closeHost(host, "said goodbye");
             case Release release -> {
-                this.registry.retire(HEX.parseHex(host.key), Instant.now());
-                this.closeHost(host, "retired its name");
+                if (HostIdentity.verifyRelease(host.publicKey, release.session(), release.signature())) {
+                    this.registry.retire(HEX.parseHex(host.key), Instant.now());
+                    this.closeHost(host, "retired its name");
+                }
             }
             default -> {}
         }
@@ -460,12 +494,12 @@ final class RelayServer {
             this.closeHost(existing, "reconnected");
         }
 
-        Host host = new Host(this.newSession(), name, key, source, now);
+        Host host = new Host(this.newSession(), name, key, register.publicKey(), source, now);
         this.hosts.put(host.session, host);
         this.hostsByName.put(name, host);
         this.hostsByKey.put(key, host);
         this.metrics.hosts.set(this.hosts.size());
-        LOGGER.log(System.Logger.Level.INFO, "Host {0} online ({1})", name, register.software());
+        LOGGER.log(System.Logger.Level.INFO, "Host {0} online ({1})", name, printable(register.software()));
         this.welcome(host, register.nonce());
     }
 
@@ -476,8 +510,9 @@ final class RelayServer {
             return "The relay is full, try again later";
         }
 
+        InetAddress network = RateLimiter.networkOf(source.getAddress());
         long fromAddress = this.hosts.values().stream()
-                .filter(host -> host != existing && host.address.getAddress().equals(source.getAddress()))
+                .filter(host -> host != existing && RateLimiter.networkOf(host.address.getAddress()).equals(network))
                 .count();
         if (fromAddress >= this.config.maxHostsPerAddress()) {
             return "Too many worlds hosted from your network";
@@ -634,6 +669,15 @@ final class RelayServer {
         };
     }
 
+    // safe for the log: control characters (line breaks) replaced, cut short
+    private static String printable(String text) {
+        return text.codePoints()
+                .map(c -> Character.isISOControl(c) ? '?' : c)
+                .limit(MAX_LOGGED_SOFTWARE)
+                .collect(StringBuilder::new, StringBuilder::appendCodePoint, StringBuilder::append)
+                .toString();
+    }
+
     private static byte[] sha256(byte[] input) {
         try {
             return MessageDigest.getInstance("SHA-256").digest(input);
@@ -646,16 +690,19 @@ final class RelayServer {
 
         private final long session;
         private final String name;
+        // hex SHA-256 of publicKey, what the registry keys the name on
         private final String key;
+        private final byte[] publicKey;
         private final Map<Integer, Peer> peers = new HashMap<>();
         private InetSocketAddress address;
         private long lastSeen;
         private int nextPeer = 1;
 
-        private Host(long session, String name, String key, InetSocketAddress address, long lastSeen) {
+        private Host(long session, String name, String key, byte[] publicKey, InetSocketAddress address, long lastSeen) {
             this.session = session;
             this.name = name;
             this.key = key;
+            this.publicKey = publicKey;
             this.address = address;
             this.lastSeen = lastSeen;
         }

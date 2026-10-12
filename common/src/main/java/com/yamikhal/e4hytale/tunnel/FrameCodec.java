@@ -85,7 +85,7 @@ public final class FrameCodec {
                 writeString(out, notice.message());
             }
             case Goodbye goodbye -> out.putLong(goodbye.session());
-            case Release release -> out.putLong(release.session());
+            case Release release -> out.putLong(release.session()).put(release.signature());
         }
 
         out.flip();
@@ -132,7 +132,7 @@ public final class FrameCodec {
                 case PONG -> new Pong(in.getLong(), in.getLong());
                 case NOTICE -> new Notice(in.getLong(), readString(in));
                 case GOODBYE -> new Goodbye(in.getLong());
-                case RELEASE -> new Release(in.getLong());
+                case RELEASE -> new Release(in.getLong(), bytes(in, HostIdentity.SIGNATURE_LENGTH));
                 default -> null;
             };
         } catch (BufferUnderflowException | IllegalArgumentException | UnknownHostException e) {

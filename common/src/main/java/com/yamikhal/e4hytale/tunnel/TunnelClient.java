@@ -170,7 +170,9 @@ public final class TunnelClient {
             }
 
             if (this.state == State.ONLINE) {
-                Frame last = release ? new Release(this.session) : new Goodbye(this.session);
+                Frame last = release
+                        ? new Release(this.session, this.identity.signRelease(this.session))
+                        : new Goodbye(this.session);
                 this.sendControl(last);
                 if (release) {
                     this.sendControl(last);
@@ -352,9 +354,9 @@ public final class TunnelClient {
     }
 
     // the relay answers in another tunnel version, so it never welcomes this host. Reported once, retries continue in
-    // case the relay gets updated
+    // case the relay gets updated. Ignored while online, where it can only be a stray or forged datagram
     private void reportVersion(int version) {
-        if (this.versionReported) {
+        if (this.versionReported || this.state != State.CONNECTING) {
             return;
         }
 
