@@ -51,7 +51,9 @@ final class StatusServer {
 
     private static boolean authorized(HttpExchange exchange, String token) {
         String header = exchange.getRequestHeaders().getFirst("Authorization");
-        if (header == null) return false;
+        if (header == null) {
+            return false;
+        }
 
         // constant time, so the token can't be guessed byte by byte from response times
         return MessageDigest.isEqual(header.getBytes(StandardCharsets.UTF_8),

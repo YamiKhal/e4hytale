@@ -31,14 +31,22 @@ public final class ClientHello {
     public static Result serverName(byte[] stream) {
         ByteBuffer in = ByteBuffer.wrap(stream);
         try {
-            if (in.remaining() < 4) return new Incomplete();
+            if (in.remaining() < 4) {
+                return new Incomplete();
+            }
 
-            if (in.get() != HANDSHAKE_CLIENT_HELLO) return new Missing();
+            if (in.get() != HANDSHAKE_CLIENT_HELLO) {
+                return new Missing();
+            }
 
             int length = readUint24(in);
-            if (length > CryptoStream.MAX_LENGTH) return new Missing();
+            if (length > CryptoStream.MAX_LENGTH) {
+                return new Missing();
+            }
 
-            if (in.remaining() < length) return new Incomplete();
+            if (in.remaining() < length) {
+                return new Incomplete();
+            }
 
             ByteBuffer hello = in.slice(in.position(), length);
             // legacy_version and random
@@ -50,7 +58,9 @@ public final class ClientHello {
             while (extensions.remaining() >= 4) {
                 int type = Short.toUnsignedInt(extensions.getShort());
                 ByteBuffer extension = slice(extensions, Short.toUnsignedInt(extensions.getShort()));
-                if (type == EXTENSION_SERVER_NAME) return hostName(extension);
+                if (type == EXTENSION_SERVER_NAME) {
+                    return hostName(extension);
+                }
             }
 
             return new Missing();

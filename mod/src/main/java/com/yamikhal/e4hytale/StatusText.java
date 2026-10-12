@@ -16,7 +16,9 @@ final class StatusText {
 
     // "Online", "Connecting to the relay..." or "Not sharing"
     static Message state(@Nullable TunnelClient.Status status) {
-        if (status == null) return Message.translation("e4hytale.ui.state.stopped");
+        if (status == null) {
+            return Message.translation("e4hytale.ui.state.stopped");
+        }
 
         return status.state() == TunnelClient.State.ONLINE
                 ? Message.translation("e4hytale.ui.state.online").color("#55FF55")

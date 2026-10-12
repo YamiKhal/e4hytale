@@ -121,7 +121,9 @@ class QuicPacketsTest {
         try (InputStream in = QuicPacketsTest.class.getResourceAsStream("/aioquic-initials.txt")) {
             for (String line : new String(in.readAllBytes(), StandardCharsets.US_ASCII).split("\n")) {
                 String[] parts = line.trim().split(" ");
-                if (parts.length == 2 && parts[0].equals(set)) datagrams.add(ByteBuffer.wrap(HEX.parseHex(parts[1])));
+                if (parts.length == 2 && parts[0].equals(set)) {
+                    datagrams.add(ByteBuffer.wrap(HEX.parseHex(parts[1])));
+                }
             }
         }
 

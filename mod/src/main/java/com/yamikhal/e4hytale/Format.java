@@ -9,7 +9,9 @@ final class Format {
 
     // 950 B, 12.3 kB, 133 MB, 1.20 GB
     static String bytes(long bytes) {
-        if (bytes < 1000) return bytes + " B";
+        if (bytes < 1000) {
+            return bytes + " B";
+        }
 
         String[] units = {"kB", "MB", "GB", "TB"};
         double value = bytes;
@@ -25,13 +27,19 @@ final class Format {
 
     // 45s, 12m, 1h 05m, 3d 4h
     static String duration(long seconds) {
-        if (seconds < 60) return seconds + "s";
+        if (seconds < 60) {
+            return seconds + "s";
+        }
 
         long minutes = seconds / 60;
-        if (minutes < 60) return minutes + "m";
+        if (minutes < 60) {
+            return minutes + "m";
+        }
 
         long hours = minutes / 60;
-        if (hours < 24) return String.format(Locale.ROOT, "%dh %02dm", hours, minutes % 60);
+        if (hours < 24) {
+            return String.format(Locale.ROOT, "%dh %02dm", hours, minutes % 60);
+        }
 
         return (hours / 24) + "d " + (hours % 24) + "h";
     }

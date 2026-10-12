@@ -15,8 +15,10 @@ import com.hypixel.hytale.server.core.ui.builder.EventData;
 import com.hypixel.hytale.server.core.ui.builder.UICommandBuilder;
 import com.hypixel.hytale.server.core.ui.builder.UIEventBuilder;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
+import com.hypixel.hytale.server.core.universe.Universe;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.storage.EntityStore;
+import com.yamikhal.e4hytale.E4HytaleConfig.StartMode;
 import com.yamikhal.e4hytale.tunnel.TunnelClient;
 
 import javax.annotation.Nonnull;
@@ -26,9 +28,11 @@ import java.util.List;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
-// the e4hytale panel (/e4h): the address in a text field to select and copy, a Copy button that puts it into the
-// clipboard (hosted worlds only, the server shares the PC with the game), state, relay, players and start / stop.
-// Refreshes itself every two seconds while open. Built and updated on the player's world thread
+// the e4hytale panel (/e4h): the address in a read-only field to select and copy, a Copy button that puts it into
+// the clipboard (hosted worlds only, the server shares the PC with the game), a New address button (asks first),
+// state, relay, players, start / stop and whether sharing starts on its own. Only opened for players allowed to
+// control e4hytale (see E4hCommand). Refreshes itself every two seconds while open, built and updated on the player's
+// world thread
 final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
 
     private static final long REFRESH_SECONDS = 2;
@@ -39,14 +43,17 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
     private ScheduledFuture<?> refresher;
     // the copy hint, replaced by the result of the last copy
     private Message hint;
+    // what the address field shows, so it is only written when it changes
     @Nullable
-    private String lastAddress;
+    private String shownAddress;
+    // the New address button was pressed once and waits for the confirmation
+    private boolean confirmingNewAddress;
 
     E4hPage(PlayerRef playerRef, World world, E4Hytale plugin) {
         super(playerRef, CustomPageLifetime.CanDismissOrCloseThroughInteraction, PageEvent.CODEC);
         this.plugin = plugin;
         this.world = world;
-        this.hint = Message.translation(Constants.SINGLEPLAYER ? "e4hytale.ui.copyHint" : "e4hytale.ui.copyHintRemote");
+        this.hint = defaultHint();
     }
 
     @Override
@@ -54,10 +61,17 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
                       @Nonnull Store<EntityStore> store) {
         commands.append("Pages/E4Hytale.ui");
         commands.set("#CopyButton.Visible", Constants.SINGLEPLAYER);
-        this.fill(commands, true);
+        this.shownAddress = null;
+        this.fill(commands);
         events.addEventBinding(CustomUIEventBindingType.Activating, "#CopyButton", action(Action.Copy));
         events.addEventBinding(CustomUIEventBindingType.Activating, "#StartButton", action(Action.Start));
         events.addEventBinding(CustomUIEventBindingType.Activating, "#StopButton", action(Action.Stop));
+        events.addEventBinding(CustomUIEventBindingType.Activating, "#AutoOnButton", action(Action.AutoOn));
+        events.addEventBinding(CustomUIEventBindingType.Activating, "#AutoOffButton", action(Action.AutoOff));
+        events.addEventBinding(CustomUIEventBindingType.Activating, "#NewAddressButton", action(Action.NewAddress));
+        events.addEventBinding(CustomUIEventBindingType.Activating, "#ConfirmNewAddressButton",
+                action(Action.ConfirmNewAddress));
+        events.addEventBinding(CustomUIEventBindingType.Activating, "#KeepAddressButton", action(Action.KeepAddress));
         events.addEventBinding(CustomUIEventBindingType.Activating, "#CloseButton", action(Action.Close));
         if (this.refresher == null) {
             this.refresher = HytaleServer.SCHEDULED_EXECUTOR.scheduleWithFixedDelay(this::scheduleRefresh,
@@ -67,18 +81,24 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
 
     @Override
     public void handleDataEvent(@Nonnull Ref<EntityStore> ref, @Nonnull Store<EntityStore> store, @Nonnull PageEvent data) {
-        // the page only ever opens for players allowed to control the tunnel (see E4hCommand)
         switch (data.action) {
             case Copy -> this.copy();
-            case Start -> {
-                this.plugin.startTunnel();
-                this.refresh();
+            case Start -> this.plugin.startTunnel();
+            case Stop -> this.plugin.stopTunnel(true);
+            case AutoOn -> this.plugin.setStartMode(StartMode.ALWAYS);
+            case AutoOff -> this.plugin.setStartMode(StartMode.ASK);
+            case NewAddress -> this.confirmingNewAddress = true;
+            case ConfirmNewAddress -> {
+                this.confirmingNewAddress = false;
+                this.hint = defaultHint();
+                this.plugin.newAddress();
             }
-            case Stop -> {
-                this.plugin.stopTunnel(true);
-                this.refresh();
-            }
+            case KeepAddress -> this.confirmingNewAddress = false;
             case Close -> this.close();
+        }
+
+        if (data.action != Action.Close) {
+            this.refresh();
         }
     }
 
@@ -91,7 +111,9 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
     private void copy() {
         TunnelClient tunnel = this.plugin.tunnel();
         String address = tunnel == null ? null : tunnel.address();
-        if (address == null) return;
+        if (address == null) {
+            return;
+        }
 
         Thread.ofVirtual().start(() -> {
             boolean copied = Clipboard.copy(address);
@@ -105,6 +127,13 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
     }
 
     private void scheduleRefresh() {
+        Universe universe = Universe.get();
+        if (universe == null || universe.getPlayer(this.playerRef.getUuid()) == null) {
+            // the player left without closing the page
+            this.stopRefreshing();
+            return;
+        }
+
         try {
             this.world.execute(this::refresh);
         } catch (RuntimeException e) {
@@ -115,36 +144,32 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
 
     private void refresh() {
         UICommandBuilder commands = new UICommandBuilder();
-        this.fill(commands, false);
+        this.fill(commands);
         this.sendUpdate(commands, false);
     }
 
-    // the address field is only written when it changes, so a selection the player is making isn't wiped every refresh
-    private void fill(UICommandBuilder commands, boolean first) {
+    private void fill(UICommandBuilder commands) {
         TunnelClient tunnel = this.plugin.tunnel();
         TunnelClient.Status status = tunnel == null ? null : tunnel.status();
         String address = status == null ? null : status.address();
         String shown = address != null ? address : "";
-        if (first || !shown.equals(this.lastAddress)) {
+        if (!shown.equals(this.shownAddress)) {
             commands.set("#Address.Value", shown);
-            this.lastAddress = shown;
+            this.shownAddress = shown;
         }
 
         commands.set("#State.TextSpans", StatusText.state(status));
         commands.set("#CopyHint.TextSpans", address != null ? this.hint : Message.translation("e4hytale.ui.noAddress"));
         commands.set("#Relay.TextSpans", StatusText.relay(this.plugin.relay(), status));
         commands.set("#PlayersCaption.TextSpans", StatusText.playersCaption(status));
-        List<Message> players = StatusText.players(this.plugin, status);
-        Message list = Message.empty();
-        for (int i = 0; i < players.size(); i++) {
-            if (i > 0) list.insert("\n");
-
-            list.insert(players.get(i));
-        }
-
-        commands.set("#PlayerList.TextSpans", list);
+        commands.set("#PlayerList.TextSpans", joinLines(StatusText.players(this.plugin, status)));
         commands.set("#StartButton.Visible", tunnel == null);
         commands.set("#StopButton.Visible", tunnel != null);
+        boolean auto = this.plugin.startMode() == StartMode.ALWAYS;
+        commands.set("#AutoOnButton.Visible", !auto);
+        commands.set("#AutoOffButton.Visible", auto);
+        commands.set("#NewAddressButton.Visible", !this.confirmingNewAddress);
+        commands.set("#NewAddressConfirm.Visible", this.confirmingNewAddress);
     }
 
     private void stopRefreshing() {
@@ -152,6 +177,23 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
             this.refresher.cancel(false);
             this.refresher = null;
         }
+    }
+
+    private static Message joinLines(List<Message> lines) {
+        Message joined = Message.empty();
+        for (int i = 0; i < lines.size(); i++) {
+            if (i > 0) {
+                joined.insert("\n");
+            }
+
+            joined.insert(lines.get(i));
+        }
+
+        return joined;
+    }
+
+    private static Message defaultHint() {
+        return Message.translation(Constants.SINGLEPLAYER ? "e4hytale.ui.copyHint" : "e4hytale.ui.copyHintRemote");
     }
 
     private static EventData action(Action action) {
@@ -162,6 +204,11 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
         Copy,
         Start,
         Stop,
+        AutoOn,
+        AutoOff,
+        NewAddress,
+        ConfirmNewAddress,
+        KeepAddress,
         Close
     }
 
@@ -169,8 +216,8 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
     static final class PageEvent {
 
         static final BuilderCodec<PageEvent> CODEC = BuilderCodec.builder(PageEvent.class, PageEvent::new)
-                .append(new KeyedCodec<>("Action", new EnumCodec<>(Action.class)),
-                        (data, action) -> data.action = action, data -> data.action)
+                .append(new KeyedCodec<>("Action", new EnumCodec<>(Action.class)), (data, action) -> data.action = action,
+                        data -> data.action)
                 .add()
                 .build();
 

@@ -1,5 +1,6 @@
 package com.yamikhal.e4hytale.tunnel;
 
+import com.yamikhal.e4hytale.tunnel.Frame.Challenge;
 import com.yamikhal.e4hytale.tunnel.Frame.Data;
 import com.yamikhal.e4hytale.tunnel.Frame.Goodbye;
 import com.yamikhal.e4hytale.tunnel.Frame.Hello;
@@ -8,7 +9,9 @@ import com.yamikhal.e4hytale.tunnel.Frame.PeerClose;
 import com.yamikhal.e4hytale.tunnel.Frame.PeerOpen;
 import com.yamikhal.e4hytale.tunnel.Frame.Ping;
 import com.yamikhal.e4hytale.tunnel.Frame.Pong;
+import com.yamikhal.e4hytale.tunnel.Frame.Register;
 import com.yamikhal.e4hytale.tunnel.Frame.Reject;
+import com.yamikhal.e4hytale.tunnel.Frame.Release;
 import com.yamikhal.e4hytale.tunnel.Frame.Welcome;
 
 import javax.annotation.Nullable;
@@ -21,6 +24,7 @@ import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.DatagramChannel;
+import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -31,12 +35,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
-// the host's end of the tunnel. Keeps one UDP socket to the relay (outbound, so no port forwarding is needed), says
-// hello until the relay assigns an address, then keeps the session alive and forwards every joiner's datagrams to the
-// game server through one PeerLink each. Reconnects on its own when the relay restarts or stops answering.
-// Thread-safe: the receive loop runs on a virtual thread, timers on one scheduler thread, peer links on their own
-// virtual threads. Callbacks to the listener come from those threads
+// the host's end of the tunnel. Keeps one UDP socket to the relay (outbound, so no port forwarding is needed),
+// registers with the host's identity until the relay assigns an address (see Frame for the handshake), then keeps the
+// session alive and passes every joiner's datagrams to the game server through one PeerLink each. Reconnects on its
+// own when the relay restarts or stops answering. Thread-safe: the receive loop runs on a virtual thread, timers on
+// one scheduler thread, peer links on their own virtual threads. Listener calls come from those threads
 public final class TunnelClient {
 
     public static final int DEFAULT_PORT = 5521;
@@ -48,15 +53,19 @@ public final class TunnelClient {
     private static final Duration MAX_RETRY_DELAY = Duration.ofSeconds(30);
     // a joiner without traffic for this long is gone. QUIC sends keepalives far more often
     private static final Duration PEER_IDLE_TIMEOUT = Duration.ofSeconds(60);
+    // local sockets at most, whatever the relay asks for (it allows 32 per host by default)
+    private static final int MAX_LINKS = 64;
     // until the welcome says otherwise: what fits a 1280 byte IPv6 path through the tunnel
     private static final int FALLBACK_MAX_PAYLOAD = 1200;
+    private static final Pattern HOST_NAME = Pattern.compile("[a-z0-9-]{1,63}(\\.[a-z0-9-]{1,63}){1,10}");
 
     private final String relayHost;
     private final int relayPort;
-    private final byte[] hostKey;
+    private final HostIdentity identity;
     private final String software;
     private final InetSocketAddress target;
     private final Listener listener;
+    private final SecureRandom random = new SecureRandom();
     private final Map<Integer, PeerLink> links = new ConcurrentHashMap<>();
     private final Object lock = new Object();
 
@@ -69,9 +78,12 @@ public final class TunnelClient {
     private int hellosSent;
     private long nextHelloNanos;
     private int failures;
+    private boolean versionReported;
     private volatile State state = State.STOPPED;
     @Nullable
     private volatile InetSocketAddress relayAddress;
+    // fresh for every registration attempt, the relay's challenge, welcome and rejects echo it
+    private volatile long nonce;
     private volatile long session;
     @Nullable
     private volatile String address;
@@ -79,23 +91,22 @@ public final class TunnelClient {
     private volatile int keepaliveSeconds = 15;
     private volatile long lastHeardNanos;
     private volatile long lastPingNanos;
+    // round trip of the last ping, -1 before the first pong
     private volatile long rttNanos = -1;
     private volatile long onlineSinceNanos;
 
-    public TunnelClient(String relayHost, int relayPort, byte[] hostKey, String software, InetSocketAddress target,
+    public TunnelClient(String relayHost, int relayPort, HostIdentity identity, String software, InetSocketAddress target,
                         Listener listener) {
-        if (hostKey.length != Frame.HOST_KEY_LENGTH) throw new IllegalArgumentException("Host key must be 32 bytes");
-
         this.relayHost = relayHost;
         this.relayPort = relayPort;
-        this.hostKey = hostKey.clone();
+        this.identity = identity;
         this.software = software;
         this.target = target;
         this.listener = listener;
     }
 
     public enum State {
-        // saying hello, either for the first time or after losing the relay
+        // registering, either for the first time or after losing the relay
         CONNECTING,
         ONLINE,
         STOPPED
@@ -107,7 +118,7 @@ public final class TunnelClient {
         // the relay assigned this address, joiners type it into Direct Connect
         void online(String address);
 
-        // the tunnel went down. retrying is false when the relay refused the host for good (outdated, limit)
+        // the tunnel went down. retrying is false when the relay refused the host for good (limits)
         void offline(String reason, boolean retrying);
 
         void joined(int peer, InetSocketAddress address);
@@ -118,25 +129,26 @@ public final class TunnelClient {
         void notice(String message);
     }
 
-    // bytesIn/rateIn = from the joiner to the server, bytesOut/rateOut = from the server to the joiner. dropped =
-    // server datagrams too large for the tunnel (see PeerLink#receiveLoop)
+    // bytesIn and rateIn = from the joiner to the server, bytesOut and rateOut = from the server to the joiner (bytes,
+    // bytes per second). dropped = server datagrams too large for the tunnel (see PeerLink#receiveLoop)
     public record PeerStatus(int peer, InetSocketAddress address, int localPort, long connectedSeconds, long bytesIn,
                              long bytesOut, long rateIn, long rateOut, long dropped) {}
 
-    // onlineSeconds = time since the current address was assigned, 0 while not online
+    // rttMillis = -1 before the first pong, onlineSeconds = time since the current address was assigned (0 offline)
     public record Status(State state, @Nullable String address, @Nullable InetSocketAddress relay, long rttMillis,
                          long onlineSeconds, List<PeerStatus> peers) {}
 
     public void start() throws IOException {
         synchronized (this.lock) {
-            if (this.state != State.STOPPED) return;
+            if (this.state != State.STOPPED) {
+                return;
+            }
 
-            this.channel = DatagramChannel.open();
-            this.channel.bind(null);
+            DatagramChannel opened = DatagramChannel.open();
+            opened.bind(null);
+            this.channel = opened;
             this.state = State.CONNECTING;
-            this.failures = 0;
-            this.nextHelloNanos = System.nanoTime();
-            DatagramChannel opened = this.channel;
+            this.restart();
             Thread.ofVirtual().name("e4hytale-tunnel").start(() -> this.receiveLoop(opened));
             this.scheduler = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon()
                     .name("e4hytale-timer").factory());
@@ -144,13 +156,25 @@ public final class TunnelClient {
         }
     }
 
-    // says goodbye so the relay frees the address at once, then closes everything. No listener calls afterwards
+    // says goodbye so the relay ends the session at once, then closes everything. No listener calls afterwards
     public void stop() {
+        this.stop(false);
+    }
+
+    // like stop(), and with release the relay also forgets the address, so the name is free for others (used before
+    // switching to a new identity). Sent twice: UDP may drop one, and nothing answers it
+    public void stop(boolean release) {
         synchronized (this.lock) {
-            if (this.state == State.STOPPED) return;
+            if (this.state == State.STOPPED) {
+                return;
+            }
 
             if (this.state == State.ONLINE) {
-                this.sendControl(new Goodbye(this.session));
+                Frame last = release ? new Release(this.session) : new Goodbye(this.session);
+                this.sendControl(last);
+                if (release) {
+                    this.sendControl(last);
+                }
             }
 
             this.state = State.STOPPED;
@@ -161,7 +185,9 @@ public final class TunnelClient {
 
             this.closeLinks();
             try {
-                if (this.channel != null) this.channel.close();
+                if (this.channel != null) {
+                    this.channel.close();
+                }
             } catch (IOException e) {
                 // nothing left to clean up if the socket is already broken
                 LOGGER.log(System.Logger.Level.DEBUG, "Closing the tunnel socket failed: {0}", e.getMessage());
@@ -182,10 +208,6 @@ public final class TunnelClient {
         return this.address;
     }
 
-    public InetSocketAddress target() {
-        return this.target;
-    }
-
     public Status status() {
         long now = System.nanoTime();
         List<PeerStatus> peers = new ArrayList<>();
@@ -201,16 +223,6 @@ public final class TunnelClient {
         return new Status(this.state, this.address, this.relayAddress, rtt, online, peers);
     }
 
-    // the joiner a local port belongs to, so the server's view (127.0.0.1:port) can be mapped to the real address
-    @Nullable
-    public InetSocketAddress joinerAt(int localPort) {
-        for (PeerLink link : this.links.values()) {
-            if (link.localPort() == localPort) return link.address();
-        }
-
-        return null;
-    }
-
     int maxPayload() {
         return this.maxPayload;
     }
@@ -219,7 +231,9 @@ public final class TunnelClient {
     void sendData(int peer, ByteBuffer payload, ByteBuffer out) {
         DatagramChannel channel = this.channel;
         InetSocketAddress relay = this.relayAddress;
-        if (this.state != State.ONLINE || channel == null || relay == null) return;
+        if (this.state != State.ONLINE || channel == null || relay == null) {
+            return;
+        }
 
         FrameCodec.encodeData(this.session, peer, payload, out);
         this.send(channel, out, relay);
@@ -231,9 +245,8 @@ public final class TunnelClient {
             if (this.state == State.CONNECTING && now - this.nextHelloNanos >= 0) {
                 this.sayHello(now);
             } else if (this.state == State.ONLINE) {
-                long silence = now - this.lastHeardNanos;
-                if (silence > TimeUnit.SECONDS.toNanos(this.keepaliveSeconds * 3L)) {
-                    this.lose("The relay stopped answering", true);
+                if (now - this.lastHeardNanos > TimeUnit.SECONDS.toNanos(this.keepaliveSeconds * 3L)) {
+                    this.lose("The relay stopped answering");
                     return;
                 }
 
@@ -273,7 +286,7 @@ public final class TunnelClient {
         }
 
         this.hellosSent++;
-        this.sendControl(new Hello(this.hostKey, this.software));
+        this.sendControl(new Hello(this.nonce, this.software));
         this.nextHelloNanos = now + TICK.toNanos();
     }
 
@@ -297,7 +310,9 @@ public final class TunnelClient {
     // waits longer after every failed round. Only the first failure is reported, the host doesn't need one per retry
     private void fail(String reason, long now) {
         this.failures++;
-        if (this.failures == 1) this.listener.offline(reason, true);
+        if (this.failures == 1) {
+            this.listener.offline(reason, true);
+        }
 
         long delay = Math.min(MAX_RETRY_DELAY.toNanos(), TICK.toNanos() << Math.min(this.failures, 5));
         // jitter, so hosts that lost the same relay don't all come back in the same second
@@ -315,8 +330,16 @@ public final class TunnelClient {
                 // only the relay may talk to this socket, anything else is spoofed or stray
                 if (source == null || !source.equals(this.relayAddress)) continue;
 
+                int version = FrameCodec.versionOf(in);
+                if (version >= 0 && version != Frame.VERSION) {
+                    this.reportVersion(version);
+                    continue;
+                }
+
                 Frame frame = FrameCodec.decode(in);
-                if (frame != null) this.handle(frame);
+                if (frame != null) {
+                    this.handle(frame);
+                }
             } catch (ClosedChannelException e) {
                 return;
             } catch (IOException e) {
@@ -328,47 +351,50 @@ public final class TunnelClient {
         }
     }
 
+    // the relay answers in another tunnel version, so it never welcomes this host. Reported once, retries continue in
+    // case the relay gets updated
+    private void reportVersion(int version) {
+        if (this.versionReported) {
+            return;
+        }
+
+        this.versionReported = true;
+        this.listener.offline("The relay speaks tunnel version " + version + ", this e4hytale speaks " + Frame.VERSION
+                + ". Update e4hytale (or the relay)", true);
+    }
+
     private void handle(Frame frame) {
-        if (this.state == State.STOPPED) return;
-
-        if (frame instanceof Welcome welcome) {
-            this.welcome(welcome);
+        if (this.state == State.STOPPED) {
             return;
         }
 
-        if (frame instanceof Reject reject) {
-            this.reject(reject);
-            return;
-        }
-
-        if (this.state != State.ONLINE || sessionOf(frame) != this.session) return;
-
-        this.lastHeardNanos = System.nanoTime();
         switch (frame) {
-            case Data data -> {
-                PeerLink link = this.link(data.peer(), null);
-                if (link != null) link.deliver(data.payload());
-            }
-            case PeerOpen open -> {
-                PeerLink link = this.link(open.peer(), open.address());
-                if (link != null) this.listener.joined(open.peer(), open.address());
-            }
-            case PeerClose close -> {
-                PeerLink link = this.links.remove(close.peer());
-                if (link != null) {
-                    link.close();
-                    this.listener.left(close.peer());
-                }
-            }
-            case Pong pong -> this.rttNanos = System.nanoTime() - pong.nonce();
-            case Notice notice -> this.listener.notice(notice.message());
-            default -> {}
+            case Challenge challenge -> this.register(challenge);
+            case Welcome welcome -> this.welcome(welcome);
+            case Reject reject -> this.reject(reject);
+            default -> this.handleSession(frame);
         }
+    }
+
+    // answers the relay's challenge with a signed registration
+    private void register(Challenge challenge) {
+        if (this.state != State.CONNECTING || challenge.nonce() != this.nonce) {
+            return;
+        }
+
+        byte[] signature = this.identity.sign(challenge.nonce(), challenge.cookie());
+        this.sendControl(new Register(challenge.nonce(), challenge.cookie(), this.identity.publicKey(), signature,
+                this.software));
     }
 
     private void welcome(Welcome welcome) {
         synchronized (this.lock) {
-            if (this.state == State.STOPPED) return;
+            // a welcome answers this attempt's nonce, anything else is old or forged. The name is shown to players, so it
+            // has to be a host name and nothing else
+            if (this.state == State.STOPPED || welcome.nonce() != this.nonce
+                    || !HOST_NAME.matcher(welcome.name()).matches()) {
+                return;
+            }
 
             boolean changed = this.state != State.ONLINE || welcome.session() != this.session;
             if (changed) {
@@ -393,47 +419,110 @@ public final class TunnelClient {
     }
 
     private void reject(Reject reject) {
+        boolean ours = this.state == State.ONLINE ? reject.token() == this.session : reject.token() == this.nonce;
+        if (!ours) {
+            return;
+        }
+
         switch (reject.reason()) {
-            case UNKNOWN_SESSION, SHUTDOWN -> this.lose(reject.message(), true);
-            case OUTDATED, LIMIT, BAD_REQUEST -> {
+            case UNKNOWN_SESSION -> this.lose("The relay restarted");
+            case SHUTDOWN -> this.lose(reject.message());
+            case LIMIT, BAD_REQUEST -> {
                 this.listener.offline(reject.message(), false);
                 this.stop();
             }
         }
     }
 
-    // back to saying hello, e.g. after the relay restarted. Joiners reconnect on their own once the address is back
-    private void lose(String reason, boolean retrying) {
-        synchronized (this.lock) {
-            if (this.state != State.ONLINE) return;
-
-            this.state = State.CONNECTING;
-            this.closeLinks();
-            this.hellosSent = 0;
-            // counts as reported, so the retries that follow stay quiet
-            this.failures = 1;
-            this.nextHelloNanos = System.nanoTime();
+    private void handleSession(Frame frame) {
+        if (this.state != State.ONLINE || sessionOf(frame) != this.session) {
+            return;
         }
 
-        this.listener.offline(reason, retrying);
+        this.lastHeardNanos = System.nanoTime();
+        switch (frame) {
+            case Data data -> {
+                PeerLink link = this.link(data.peer(), null);
+                if (link != null) {
+                    link.deliver(data.payload());
+                }
+            }
+            case PeerOpen open -> {
+                PeerLink link = this.link(open.peer(), open.address());
+                if (link != null) {
+                    this.listener.joined(open.peer(), open.address());
+                }
+            }
+            case PeerClose close -> {
+                PeerLink link = this.links.remove(close.peer());
+                if (link != null) {
+                    link.close();
+                    this.listener.left(close.peer());
+                }
+            }
+            case Pong pong -> this.rttNanos = System.nanoTime() - pong.nonce();
+            case Notice notice -> this.listener.notice(notice.message());
+            default -> {}
+        }
     }
 
-    // the link of a peer, opened on first sight. Data may arrive before the peer's PeerOpen or without it, if that
-    // datagram got lost
+    // back to registering, e.g. after the relay restarted. Joiners reconnect on their own once the address is back
+    private void lose(String reason) {
+        synchronized (this.lock) {
+            if (this.state == State.STOPPED) {
+                return;
+            }
+
+            boolean wasOnline = this.state == State.ONLINE;
+            this.state = State.CONNECTING;
+            this.closeLinks();
+            this.restart();
+            // counts as reported, so the retries that follow stay quiet
+            this.failures = 1;
+            if (!wasOnline) {
+                return;
+            }
+        }
+
+        this.listener.offline(reason, true);
+    }
+
+    // a new registration attempt: new nonce, first relay address, at once
+    private void restart() {
+        this.nonce = this.random.nextLong();
+        this.hellosSent = 0;
+        this.failures = 0;
+        this.nextHelloNanos = System.nanoTime();
+    }
+
+    // the link of a peer, opened on first sight. Data may arrive before the peer's PeerOpen, or without it if that
+    // datagram got lost. Null when the link limit is reached or no local socket could be opened
     @Nullable
     private PeerLink link(int peer, @Nullable InetSocketAddress address) {
-        PeerLink link = this.links.computeIfAbsent(peer, id -> {
-            try {
-                return new PeerLink(this, id, this.target,
-                        address != null ? address : new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
-            } catch (IOException e) {
-                LOGGER.log(System.Logger.Level.WARNING, "Could not open a local socket for a joiner", e);
+        PeerLink link = this.links.get(peer);
+        if (link == null) {
+            if (this.links.size() >= MAX_LINKS) {
                 return null;
             }
-        });
-        if (link != null && address != null) link.setAddress(address);
+
+            link = this.links.computeIfAbsent(peer, this::open);
+        }
+
+        if (link != null && address != null) {
+            link.setAddress(address);
+        }
 
         return link;
+    }
+
+    @Nullable
+    private PeerLink open(int peer) {
+        try {
+            return new PeerLink(this, peer, this.target);
+        } catch (IOException e) {
+            LOGGER.log(System.Logger.Level.WARNING, "Could not open a local socket for a joiner", e);
+            return null;
+        }
     }
 
     private void closeIdleLinks(long now) {
@@ -442,7 +531,9 @@ public final class TunnelClient {
 
             if (this.links.remove(link.peer(), link)) {
                 link.close();
-                if (this.state == State.ONLINE) this.sendControl(new PeerClose(this.session, link.peer()));
+                if (this.state == State.ONLINE) {
+                    this.sendControl(new PeerClose(this.session, link.peer()));
+                }
 
                 this.listener.left(link.peer());
             }
@@ -460,9 +551,11 @@ public final class TunnelClient {
     private void sendControl(Frame frame) {
         DatagramChannel channel = this.channel;
         InetSocketAddress relay = this.relayAddress;
-        if (channel == null || relay == null) return;
+        if (channel == null || relay == null) {
+            return;
+        }
 
-        ByteBuffer out = ByteBuffer.allocate(Frame.HELLO_SIZE + 512);
+        ByteBuffer out = ByteBuffer.allocate(Frame.PADDED_SIZE + 2048);
         FrameCodec.encode(frame, out);
         this.send(channel, out, relay);
     }
@@ -472,12 +565,14 @@ public final class TunnelClient {
             channel.send(frame, relay);
         } catch (ClosedChannelException e) {
             // stopping, the datagram is no longer wanted
+            LOGGER.log(System.Logger.Level.TRACE, "Dropped a datagram while stopping");
         } catch (IOException e) {
             // no route right now (network switching, IPv6 down). UDP is lossy anyway, retries cover it
             LOGGER.log(System.Logger.Level.DEBUG, "Tunnel send failed: {0}", e.getMessage());
         }
     }
 
+    // 0 for frames without a session
     private static long sessionOf(Frame frame) {
         return switch (frame) {
             case Data data -> data.session();
@@ -485,11 +580,7 @@ public final class TunnelClient {
             case PeerClose close -> close.session();
             case Pong pong -> pong.session();
             case Notice notice -> notice.session();
-            case Ping ping -> ping.session();
-            case Goodbye goodbye -> goodbye.session();
-            case Welcome welcome -> welcome.session();
-            case Hello hello -> 0;
-            case Reject reject -> 0;
+            default -> 0;
         };
     }
 }

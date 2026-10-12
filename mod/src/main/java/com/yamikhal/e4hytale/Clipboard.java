@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
@@ -21,11 +22,15 @@ final class Clipboard {
     static boolean copy(String text) {
         String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
         if (os.contains("win")) {
-            // clip.exe reads the console code page, ASCII is the same in all of them (and addresses are ASCII)
-            return run(List.of("clip"), text, StandardCharsets.US_ASCII);
+            // by full path, so nothing named clip earlier in PATH runs instead. clip.exe reads the console code page,
+            // ASCII is the same in all of them (and addresses are ASCII)
+            String system = System.getenv().getOrDefault("SystemRoot", "C:\\Windows");
+            return run(List.of(Path.of(system, "System32", "clip.exe").toString()), text, StandardCharsets.US_ASCII);
         }
 
-        if (os.contains("mac")) return run(List.of("pbcopy"), text, StandardCharsets.UTF_8);
+        if (os.contains("mac")) {
+            return run(List.of("/usr/bin/pbcopy"), text, StandardCharsets.UTF_8);
+        }
 
         return run(List.of("wl-copy"), text, StandardCharsets.UTF_8)
                 || run(List.of("xclip", "-selection", "clipboard"), text, StandardCharsets.UTF_8)

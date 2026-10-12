@@ -5,6 +5,7 @@ import com.yamikhal.e4hytale.relay.quic.CryptoStream;
 import com.yamikhal.e4hytale.relay.quic.InitialKeys;
 import com.yamikhal.e4hytale.relay.quic.QuicPackets;
 import com.yamikhal.e4hytale.tunnel.Frame;
+import com.yamikhal.e4hytale.tunnel.Frame.Challenge;
 import com.yamikhal.e4hytale.tunnel.Frame.Data;
 import com.yamikhal.e4hytale.tunnel.Frame.Goodbye;
 import com.yamikhal.e4hytale.tunnel.Frame.Hello;
@@ -14,11 +15,16 @@ import com.yamikhal.e4hytale.tunnel.Frame.PeerOpen;
 import com.yamikhal.e4hytale.tunnel.Frame.Ping;
 import com.yamikhal.e4hytale.tunnel.Frame.Pong;
 import com.yamikhal.e4hytale.tunnel.Frame.Reason;
+import com.yamikhal.e4hytale.tunnel.Frame.Register;
 import com.yamikhal.e4hytale.tunnel.Frame.Reject;
+import com.yamikhal.e4hytale.tunnel.Frame.Release;
 import com.yamikhal.e4hytale.tunnel.Frame.Welcome;
 import com.yamikhal.e4hytale.tunnel.FrameCodec;
+import com.yamikhal.e4hytale.tunnel.HostIdentity;
 
 import javax.annotation.Nullable;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -44,18 +50,18 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
-// the relay: joiners send QUIC to the game port, hosts keep tunnels open to the tunnel port, and every joiner's
-// datagrams are passed to the host whose name was in the joiner's ClientHello (see quic package). The relay never
-// decrypts game traffic past that first message. Everything runs on one thread around a selector, so no state here
-// needs locking; other threads talk to it through `broadcast` and `stop`
+// the relay: joiners send QUIC to the game port, hosts keep tunnels open to the tunnel port (see Frame for how they
+// register), and every joiner's datagrams are passed to the host whose name was in the joiner's ClientHello (see the
+// quic package). The relay never decrypts game traffic past that first message. Everything runs on one thread around
+// a selector, so no state here needs locking; other threads talk to it through broadcast and stop
 final class RelayServer {
 
     private static final System.Logger LOGGER = System.getLogger("e4hytale-relay");
     private static final HexFormat HEX = HexFormat.of();
     private static final Duration TIMER_INTERVAL = Duration.ofSeconds(1);
     private static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(5);
-    private static final Duration SAVE_INTERVAL = Duration.ofMinutes(1);
-    // joiners waiting for the rest of their ClientHello, more at once are refused (each holds a CryptoStream)
+    private static final Duration HOUSEKEEPING_INTERVAL = Duration.ofMinutes(1);
+    // joiners waiting for the rest of their ClientHello, more at once are refused
     private static final int MAX_HANDSHAKES = 1024;
     private static final int MAX_HANDSHAKE_DATAGRAMS = 8;
     // largest joiner datagram passed on. Client Initials are padded to 1200 or a bit more, and a joiner's path MTU
@@ -64,13 +70,17 @@ final class RelayServer {
     private static final int MAX_JOINER_PAYLOAD = 1400;
     // server connection ids remembered per joiner, to find it again when its address changes (NAT rebinding)
     private static final int MAX_CIDS_PER_PEER = 4;
-    // new tunnels per source address and minute (a host only needs one, retries reuse it)
-    private static final int HELLOS_PER_MINUTE = 10;
+    // registrations per source address and minute (a host needs one, retries after a lost welcome reuse it)
+    private static final int REGISTRATIONS_PER_MINUTE = 10;
+    // a cookie is accepted in the minute it was made and the next one
+    private static final long COOKIE_MINUTE_MILLIS = 60_000;
 
     private final RelayConfig config;
     private final NameRegistry registry;
     private final Metrics metrics;
     private final SecureRandom random = new SecureRandom();
+    // keys the cookies, new on every start so old cookies die with the old process
+    private final SecretKeySpec cookieKey;
     private final ByteBuffer in = ByteBuffer.allocateDirect(65_535);
     private final ByteBuffer out = ByteBuffer.allocateDirect(65_535 + Frame.DATA_OVERHEAD);
     private final Map<Long, Host> hosts = new HashMap<>();
@@ -81,20 +91,26 @@ final class RelayServer {
     private final Set<Integer> cidLengths = new HashSet<>();
     private final Map<InetSocketAddress, Handshake> handshakes = new HashMap<>();
     private final RateLimiter handshakeLimiter;
-    private final RateLimiter helloLimiter = new RateLimiter(HELLOS_PER_MINUTE);
+    private final RateLimiter registrationLimiter = new RateLimiter(REGISTRATIONS_PER_MINUTE, Duration.ofMinutes(1));
+    private final RateLimiter newNameLimiter;
     private final ConcurrentLinkedQueue<String> notices = new ConcurrentLinkedQueue<>();
     private final Selector selector;
     private final DatagramChannel game;
     private final DatagramChannel tunnel;
+
     private volatile boolean running = true;
     private long lastTimer;
-    private long lastSave;
+    private long lastHousekeeping;
 
     RelayServer(RelayConfig config, NameRegistry registry, Metrics metrics) throws IOException {
         this.config = config;
         this.registry = registry;
         this.metrics = metrics;
-        this.handshakeLimiter = new RateLimiter(config.handshakesPerMinute());
+        byte[] secret = new byte[32];
+        this.random.nextBytes(secret);
+        this.cookieKey = new SecretKeySpec(secret, "HmacSHA256");
+        this.handshakeLimiter = new RateLimiter(config.handshakesPerMinute(), Duration.ofMinutes(1));
+        this.newNameLimiter = new RateLimiter(config.newNamesPerDay(), Duration.ofDays(1));
         this.selector = Selector.open();
         this.game = open(config.gamePort());
         this.tunnel = open(config.tunnelPort());
@@ -122,12 +138,7 @@ final class RelayServer {
                     this.timers(now);
                 }
 
-                String notice;
-                while ((notice = this.notices.poll()) != null) {
-                    for (Host host : this.hosts.values()) {
-                        this.sendTunnel(new Notice(host.session, notice), host.address);
-                    }
-                }
+                this.sendNotices();
             } catch (IOException | RuntimeException e) {
                 // one bad datagram or a transient socket error must never take the relay down
                 LOGGER.log(System.Logger.Level.WARNING, "Relay loop error", e);
@@ -135,7 +146,7 @@ final class RelayServer {
         }
 
         for (Host host : List.copyOf(this.hosts.values())) {
-            this.sendTunnel(new Reject(Reason.SHUTDOWN, "The relay is restarting"), host.address);
+            this.sendTunnel(new Reject(host.session, Reason.SHUTDOWN, "The relay is restarting"), host.address);
         }
 
         this.saveRegistry();
@@ -154,6 +165,12 @@ final class RelayServer {
         this.selector.wakeup();
     }
 
+    // a message for every connected host, sent from the loop thread
+    void broadcast(String message) {
+        this.notices.add(message);
+        this.selector.wakeup();
+    }
+
     // the bound ports, which differ from the configured ones when those are 0 (tests)
     int gamePort() throws IOException {
         return ((InetSocketAddress) this.game.getLocalAddress()).getPort();
@@ -163,18 +180,14 @@ final class RelayServer {
         return ((InetSocketAddress) this.tunnel.getLocalAddress()).getPort();
     }
 
-    // a message for every connected host, sent from the loop thread
-    void broadcast(String message) {
-        this.notices.add(message);
-        this.selector.wakeup();
-    }
-
     private void drain(DatagramChannel channel) throws IOException {
         // bounded, so one busy socket can't starve the other or the timers
         for (int i = 0; i < 256; i++) {
             this.in.clear();
             SocketAddress source = channel.receive(this.in);
-            if (!(source instanceof InetSocketAddress address)) return;
+            if (!(source instanceof InetSocketAddress address)) {
+                return;
+            }
 
             this.in.flip();
             this.metrics.bytesIn.addAndGet(this.in.remaining());
@@ -190,17 +203,18 @@ final class RelayServer {
     private void onJoinerDatagram(InetSocketAddress source, ByteBuffer datagram, long now) {
         Peer peer = this.peers.get(source);
         if (peer != null) {
-            if (datagram.remaining() <= MAX_JOINER_PAYLOAD) this.forwardToHost(peer, datagram, now);
+            if (datagram.remaining() <= MAX_JOINER_PAYLOAD) {
+                this.forwardToHost(peer, datagram, now);
+            }
 
             return;
         }
 
         if (!QuicPackets.isLongHeader(datagram)) {
             this.rebind(source, datagram, now);
-            return;
+        } else if (QuicPackets.version(datagram) == InitialKeys.VERSION_1) {
+            this.handshake(source, datagram, now);
         }
-
-        if (QuicPackets.version(datagram) == InitialKeys.VERSION_1) this.handshake(source, datagram, now);
     }
 
     // collects a joiner's Initial packets until its ClientHello is complete, then routes it by the server name
@@ -276,7 +290,9 @@ final class RelayServer {
     @Nullable
     private String labelOf(String serverName) {
         String suffix = "." + this.config.domain();
-        if (!serverName.endsWith(suffix)) return null;
+        if (!serverName.endsWith(suffix)) {
+            return null;
+        }
 
         String label = serverName.substring(0, serverName.length() - suffix.length());
         return Names.isWellFormed(label) ? label : null;
@@ -285,11 +301,13 @@ final class RelayServer {
     // tells the joiner's client why it can't connect, in a CONNECTION_CLOSE it can decrypt. Much smaller than the
     // client's padded Initial, so a spoofed source can't use it for amplification
     private void refuse(Handshake handshake, String reason) {
-        if (handshake.dcid == null || handshake.scid == null) return;
+        if (handshake.dcid == null || handshake.scid == null) {
+            return;
+        }
 
         byte[] serverScid = new byte[8];
         this.random.nextBytes(serverScid);
-        this.sendGame(QuicPackets.refusal(handshake.dcid, handshake.scid, serverScid, reason), handshake.address);
+        this.send(this.game, QuicPackets.refusal(handshake.dcid, handshake.scid, serverScid, reason), handshake.address);
     }
 
     // a short header packet from an unknown address: a known joiner whose NAT gave it a new port. Found by the
@@ -316,26 +334,35 @@ final class RelayServer {
     }
 
     private void onTunnelDatagram(InetSocketAddress source, ByteBuffer datagram, long now) {
+        // replies are never larger than what they answer (a spoofed source must not turn the relay into an amplifier):
+        // hellos and registrations are padded, rejects of unknown sessions carry no message
+        int size = datagram.remaining();
         int version = FrameCodec.versionOf(datagram);
-        if (version < 0) return;
-
         if (version != Frame.VERSION) {
-            this.sendTunnel(new Reject(Reason.OUTDATED, "This relay speaks tunnel version " + Frame.VERSION
-                    + ", update e4hytale to match"), source);
+            // noise, or a host of another version: a reply in this relay's version lets that host report the mismatch
+            if (version >= 0 && size >= Frame.PADDED_SIZE) {
+                this.sendTunnel(new Reject(0, Reason.BAD_REQUEST, "Tunnel version mismatch"), source);
+            }
+
             return;
         }
 
         Frame frame = FrameCodec.decode(datagram);
-        if (frame == null) return;
-
-        if (frame instanceof Hello hello) {
-            this.hello(source, hello, now);
-            return;
+        switch (frame) {
+            case null -> {}
+            case Hello hello when size >= Frame.PADDED_SIZE ->
+                    this.sendTunnel(new Challenge(hello.nonce(), this.cookie(source, hello.nonce(), 0)), source);
+            case Hello hello -> {}
+            case Register register -> this.register(source, register, now);
+            default -> this.onSessionFrame(source, frame, now);
         }
+    }
 
-        Host host = this.hosts.get(sessionOf(frame));
+    private void onSessionFrame(InetSocketAddress source, Frame frame, long now) {
+        long session = sessionOf(frame);
+        Host host = this.hosts.get(session);
         if (host == null) {
-            this.sendTunnel(new Reject(Reason.UNKNOWN_SESSION, "The relay restarted"), source);
+            this.sendTunnel(new Reject(session, Reason.UNKNOWN_SESSION, ""), source);
             return;
         }
 
@@ -346,10 +373,16 @@ final class RelayServer {
             case Data data -> this.forwardToJoiner(host, data, now);
             case PeerClose close -> {
                 Peer peer = host.peers.get(close.peer());
-                if (peer != null) this.removePeer(peer, false);
+                if (peer != null) {
+                    this.removePeer(peer, false);
+                }
             }
             case Ping ping -> this.sendTunnel(new Pong(host.session, ping.nonce()), source);
             case Goodbye goodbye -> this.closeHost(host, "said goodbye");
+            case Release release -> {
+                this.registry.retire(HEX.parseHex(host.key), Instant.now());
+                this.closeHost(host, "retired its name");
+            }
             default -> {}
         }
     }
@@ -370,84 +403,156 @@ final class RelayServer {
 
         peer.lastSeen = now;
         if (peer.cids.size() < MAX_CIDS_PER_PEER) {
-            byte[] cid = QuicPackets.longHeaderScid(payload);
-            if (cid != null && !peer.cids.contains(ByteBuffer.wrap(cid))) {
-                ByteBuffer key = ByteBuffer.wrap(cid);
-                peer.cids.add(key);
-                this.peersByCid.put(key, peer);
-                this.cidLengths.add(cid.length);
-            }
+            this.learnCid(peer, payload);
         }
 
-        this.sendGame(payload, peer.address);
+        this.send(this.game, payload, peer.address);
     }
 
-    private void hello(InetSocketAddress source, Hello hello, long now) {
-        byte[] keyHash = sha256(hello.hostKey());
-        String key = HEX.formatHex(keyHash);
-        Host existing = this.hostsByKey.get(key);
-        if (existing != null && existing.address.equals(source)) {
-            // our welcome got lost, send it again
-            existing.lastSeen = now;
-            this.welcome(existing);
+    private void learnCid(Peer peer, ByteBuffer payload) {
+        byte[] cid = QuicPackets.longHeaderScid(payload);
+        if (cid == null || peer.cids.contains(ByteBuffer.wrap(cid))) {
             return;
         }
 
-        if (!this.helloLimiter.tryAcquire(source.getAddress(), now)) return;
+        ByteBuffer key = ByteBuffer.wrap(cid);
+        peer.cids.add(key);
+        this.peersByCid.put(key, peer);
+        this.cidLengths.add(cid.length);
+    }
+
+    // a host proving its identity. The cookie shows the registration comes from the address the challenge went to
+    // (no spoofed sources), the signature that the host owns the key its name is tied to
+    private void register(InetSocketAddress source, Register register, long now) {
+        if (!this.validCookie(source, register.nonce(), register.cookie())) {
+            return;
+        }
+
+        byte[] keyHash = sha256(register.publicKey());
+        String key = HEX.formatHex(keyHash);
+        Host existing = this.hostsByKey.get(key);
+        if (existing != null && existing.address.equals(source)) {
+            // our welcome got lost, send it again for this attempt
+            existing.lastSeen = now;
+            this.welcome(existing, register.nonce());
+            return;
+        }
+
+        if (!this.registrationLimiter.tryAcquire(source.getAddress(), now)
+                || !HostIdentity.verify(register.publicKey(), register.nonce(), register.cookie(), register.signature())) {
+            return;
+        }
+
+        String refusal = this.admit(source, keyHash, existing, now);
+        if (refusal != null) {
+            this.sendTunnel(new Reject(register.nonce(), Reason.LIMIT, refusal), source);
+            return;
+        }
+
+        String name = this.registry.claim(keyHash, Instant.now());
+        if (name == null) {
+            this.sendTunnel(new Reject(register.nonce(), Reason.LIMIT, "The relay has no free names, try later"), source);
+            return;
+        }
 
         if (existing != null) {
             // the same host from a new socket: the game restarted the tunnel, the old session is dead
             this.closeHost(existing, "reconnected");
         }
 
-        if (this.hosts.size() >= this.config.maxHosts()) {
-            this.sendTunnel(new Reject(Reason.LIMIT, "The relay is full, try again later"), source);
-            return;
-        }
-
-        long fromAddress = this.hosts.values().stream()
-                .filter(host -> host.address.getAddress().equals(source.getAddress())).count();
-        if (fromAddress >= this.config.maxHostsPerAddress()) {
-            this.sendTunnel(new Reject(Reason.LIMIT, "Too many worlds hosted from your network"), source);
-            return;
-        }
-
-        String name = this.registry.claim(keyHash, Instant.now());
         Host host = new Host(this.newSession(), name, key, source, now);
         this.hosts.put(host.session, host);
         this.hostsByName.put(name, host);
         this.hostsByKey.put(key, host);
         this.metrics.hosts.set(this.hosts.size());
-        LOGGER.log(System.Logger.Level.INFO, "Host {0} online ({1})", name, hello.software());
-        this.welcome(host);
+        LOGGER.log(System.Logger.Level.INFO, "Host {0} online ({1})", name, register.software());
+        this.welcome(host, register.nonce());
     }
 
-    private void welcome(Host host) {
-        this.sendTunnel(new Welcome(host.session, host.name + "." + this.config.domain(),
+    // why a verified host can't get a session, null if it can
+    @Nullable
+    private String admit(InetSocketAddress source, byte[] keyHash, @Nullable Host existing, long now) {
+        if (existing == null && this.hosts.size() >= this.config.maxHosts()) {
+            return "The relay is full, try again later";
+        }
+
+        long fromAddress = this.hosts.values().stream()
+                .filter(host -> host != existing && host.address.getAddress().equals(source.getAddress()))
+                .count();
+        if (fromAddress >= this.config.maxHostsPerAddress()) {
+            return "Too many worlds hosted from your network";
+        }
+
+        if (this.registry.nameOf(keyHash) == null && !this.newNameLimiter.tryAcquire(source.getAddress(), now)) {
+            return "Too many new e4hytale addresses from your network today";
+        }
+
+        return null;
+    }
+
+    private void welcome(Host host, long nonce) {
+        this.sendTunnel(new Welcome(nonce, host.session, host.name + "." + this.config.domain(),
                 (int) this.config.keepalive().toSeconds(), this.config.maxPayload()), host.address);
+    }
+
+    // HMAC of the source address, nonce and minute: proves a registration answers a challenge sent to that address,
+    // without keeping state per hello
+    private byte[] cookie(InetSocketAddress source, long nonce, int minutesAgo) {
+        long minute = System.currentTimeMillis() / COOKIE_MINUTE_MILLIS - minutesAgo;
+        byte[] address = source.getAddress().getAddress();
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(this.cookieKey);
+            mac.update(ByteBuffer.allocate(address.length + Integer.BYTES + 2 * Long.BYTES).put(address)
+                    .putInt(source.getPort()).putLong(nonce).putLong(minute).array());
+            return Arrays.copyOf(mac.doFinal(), Frame.COOKIE_LENGTH);
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("HmacSHA256 is not available", e);
+        }
+    }
+
+    private boolean validCookie(InetSocketAddress source, long nonce, byte[] cookie) {
+        return MessageDigest.isEqual(cookie, this.cookie(source, nonce, 0))
+                || MessageDigest.isEqual(cookie, this.cookie(source, nonce, 1));
     }
 
     private void timers(long now) {
         long hostTimeout = this.config.keepalive().toNanos() * 3;
         for (Host host : List.copyOf(this.hosts.values())) {
-            if (now - host.lastSeen > hostTimeout) this.closeHost(host, "timed out");
+            if (now - host.lastSeen > hostTimeout) {
+                this.closeHost(host, "timed out");
+            }
         }
 
         long peerTimeout = this.config.peerIdleTimeout().toNanos();
         for (Peer peer : List.copyOf(this.peers.values())) {
-            if (now - peer.lastSeen > peerTimeout) this.removePeer(peer, true);
+            if (now - peer.lastSeen > peerTimeout) {
+                this.removePeer(peer, true);
+            }
         }
 
         this.handshakes.values().removeIf(handshake -> now - handshake.started > HANDSHAKE_TIMEOUT.toNanos());
-        if (now - this.lastSave > SAVE_INTERVAL.toNanos()) {
-            this.lastSave = now;
+        if (now - this.lastHousekeeping > HOUSEKEEPING_INTERVAL.toNanos()) {
+            this.lastHousekeeping = now;
             this.handshakeLimiter.prune(now);
-            this.helloLimiter.prune(now);
+            this.registrationLimiter.prune(now);
+            this.newNameLimiter.prune(now);
             this.saveRegistry();
         }
 
         this.metrics.peers.set(this.peers.size());
         this.metrics.names.set(this.registry.size());
+    }
+
+    private void sendNotices() {
+        String notice = this.notices.poll();
+        while (notice != null) {
+            for (Host host : this.hosts.values()) {
+                this.sendTunnel(new Notice(host.session, notice), host.address);
+            }
+
+            notice = this.notices.poll();
+        }
     }
 
     private void closeHost(Host host, String why) {
@@ -469,14 +574,17 @@ final class RelayServer {
             this.peersByCid.remove(cid, peer);
         }
 
-        if (tellHost) this.sendTunnel(new PeerClose(peer.host.session, peer.id), peer.host.address);
+        if (tellHost) {
+            this.sendTunnel(new PeerClose(peer.host.session, peer.id), peer.host.address);
+        }
     }
 
+    // random and never 0, which stands for "no session" on the wire
     private long newSession() {
-        long session;
-        do {
+        long session = this.random.nextLong();
+        while (session == 0 || this.hosts.containsKey(session)) {
             session = this.random.nextLong();
-        } while (session == 0 || this.hosts.containsKey(session));
+        }
 
         return session;
     }
@@ -492,10 +600,6 @@ final class RelayServer {
     private void sendTunnel(Frame frame, InetSocketAddress target) {
         FrameCodec.encode(frame, this.out);
         this.send(this.tunnel, this.out, target);
-    }
-
-    private void sendGame(ByteBuffer datagram, InetSocketAddress target) {
-        this.send(this.game, datagram, target);
     }
 
     private void send(DatagramChannel channel, ByteBuffer datagram, InetSocketAddress target) {
@@ -518,12 +622,14 @@ final class RelayServer {
         return channel;
     }
 
+    // 0 for frames without a session
     private static long sessionOf(Frame frame) {
         return switch (frame) {
             case Data data -> data.session();
             case PeerClose close -> close.session();
             case Ping ping -> ping.session();
             case Goodbye goodbye -> goodbye.session();
+            case Release release -> release.session();
             default -> 0;
         };
     }

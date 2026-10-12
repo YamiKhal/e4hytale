@@ -10,7 +10,7 @@ $C.@PageOverlay {
   LayoutMode: Middle;
 
   $C.@DecoratedContainer {
-    Anchor: (Width: 640);
+    Anchor: (Width: 680);
 
     #Title {
       $C.@Title {
@@ -35,9 +35,20 @@ $C.@PageOverlay {
         LayoutMode: Left;
         Anchor: (Bottom: 6, Height: 38);
 
-        $C.@TextField #Address {
-          @Anchor = (Right: 8);
+        // read-only, so the address can be selected and copied but not changed by accident
+        Group #AddressBox {
           FlexWeight: 1;
+          Anchor: (Right: 8);
+          LayoutMode: Top;
+          Background: (Color: $C.@ColorBackgroundCode);
+
+          CodeEditor #Address {
+            FlexWeight: 1;
+            Style: (TextColor: #ffffff, FontSize: 16);
+            ContentPadding: 9;
+            IsReadOnly: true;
+            ScrollbarStyle: $C.@DefaultScrollbarStyle;
+          }
         }
 
         $C.@TextButton #CopyButton {
@@ -48,8 +59,45 @@ $C.@PageOverlay {
       }
 
       Label #CopyHint {
-        Anchor: (Bottom: 16, Horizontal: 4);
+        Anchor: (Bottom: 10, Horizontal: 4);
         Style: (...$C.@DefaultLabelStyle, FontSize: 13, TextColor: #878e9c, Wrap: true);
+      }
+
+      // New address asks first: friends who saved the old address can't use it any more
+      Group #AddressActions {
+        LayoutMode: Left;
+        Anchor: (Bottom: 16, Height: 36);
+
+        $C.@SecondaryTextButton #NewAddressButton {
+          @Sounds = $Sounds.@SaveSettings;
+          @Anchor = (Width: 200);
+          Text: %e4hytale.ui.newAddress;
+        }
+
+        Group #NewAddressConfirm {
+          LayoutMode: Left;
+          FlexWeight: 1;
+          Visible: false;
+
+          Label {
+            FlexWeight: 1;
+            Anchor: (Right: 8, Left: 4);
+            Style: (...$C.@DefaultLabelStyle, FontSize: 13, TextColor: #E8A93B, Wrap: true, VerticalAlignment: Center);
+            Text: %e4hytale.ui.newAddressWarning;
+          }
+
+          $C.@TextButton #ConfirmNewAddressButton {
+            @Sounds = $Sounds.@SaveSettings;
+            @Anchor = (Width: 170, Right: 6);
+            Text: %e4hytale.ui.newAddressConfirm;
+          }
+
+          $C.@SecondaryTextButton #KeepAddressButton {
+            @Sounds = $Sounds.@ButtonsCancel;
+            @Anchor = (Width: 120);
+            Text: %e4hytale.ui.newAddressKeep;
+          }
+        }
       }
 
       Label #Relay {
@@ -79,19 +127,31 @@ $C.@PageOverlay {
 
         $C.@TextButton #StartButton {
           @Sounds = $Sounds.@SaveSettings;
-          @Anchor = (Width: 200, Right: 6);
+          @Anchor = (Width: 190, Right: 6);
           Text: %e4hytale.ui.start;
         }
 
         $C.@SecondaryTextButton #StopButton {
           @Sounds = $Sounds.@ButtonsCancel;
-          @Anchor = (Width: 200, Right: 6);
+          @Anchor = (Width: 190, Right: 6);
           Text: %e4hytale.ui.stop;
+        }
+
+        $C.@SecondaryTextButton #AutoOnButton {
+          @Sounds = $Sounds.@SaveSettings;
+          @Anchor = (Width: 230, Left: 6, Right: 6);
+          Text: %e4hytale.ui.autoOff;
+        }
+
+        $C.@SecondaryTextButton #AutoOffButton {
+          @Sounds = $Sounds.@SaveSettings;
+          @Anchor = (Width: 230, Left: 6, Right: 6);
+          Text: %e4hytale.ui.autoOn;
         }
 
         $C.@SecondaryTextButton #CloseButton {
           @Sounds = $Sounds.@ButtonsCancel;
-          @Anchor = (Width: 160, Left: 6);
+          @Anchor = (Width: 140, Left: 6);
           Text: %e4hytale.ui.close;
         }
       }

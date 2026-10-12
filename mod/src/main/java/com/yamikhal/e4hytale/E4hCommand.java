@@ -31,15 +31,20 @@ final class E4hCommand extends AbstractPlayerCommand {
         this.addSubCommand(new Stop(plugin));
         this.addSubCommand(new Status(plugin));
         this.addSubCommand(new Copy(plugin));
+        this.addSubCommand(new NewAddress(plugin));
     }
 
     @Override
     protected void execute(@Nonnull CommandContext context, @Nonnull Store<EntityStore> store, @Nonnull Ref<EntityStore> ref,
                            @Nonnull PlayerRef playerRef, @Nonnull World world) {
-        if (!mayControl(this.plugin, context)) return;
+        if (!mayControl(this.plugin, context)) {
+            return;
+        }
 
         Player player = store.getComponent(ref, Player.getComponentType());
-        if (player != null) player.getPageManager().openCustomPage(ref, store, new E4hPage(playerRef, world, this.plugin));
+        if (player != null) {
+            player.getPageManager().openCustomPage(ref, store, new E4hPage(playerRef, world, this.plugin));
+        }
     }
 
     // tells the sender off when they may not control the tunnel
@@ -58,14 +63,21 @@ final class E4hCommand extends AbstractPlayerCommand {
         final E4Hytale plugin;
 
         Sub(E4Hytale plugin, String name) {
-            super(name, "e4hytale.commands.e4h." + name + ".desc");
+            this(plugin, name, false);
+        }
+
+        // requiresConfirmation: the command only runs when repeated with --confirm (Hytale's own mechanism)
+        Sub(E4Hytale plugin, String name, boolean requiresConfirmation) {
+            super(name, "e4hytale.commands.e4h." + name + ".desc", requiresConfirmation);
             this.plugin = plugin;
             this.requireNoPermission();
         }
 
         @Override
         protected void executeSync(@Nonnull CommandContext context) {
-            if (mayControl(this.plugin, context)) this.run(context);
+            if (mayControl(this.plugin, context)) {
+                this.run(context);
+            }
         }
 
         abstract void run(CommandContext context);
@@ -91,7 +103,21 @@ final class E4hCommand extends AbstractPlayerCommand {
 
         @Override
         void run(CommandContext context) {
-            if (!this.plugin.stopTunnel(true)) context.sendMessage(Message.translation("e4hytale.notRunning"));
+            if (!this.plugin.stopTunnel(true)) {
+                context.sendMessage(Message.translation("e4hytale.notRunning"));
+            }
+        }
+    }
+
+    private static final class NewAddress extends Sub {
+
+        NewAddress(E4Hytale plugin) {
+            super(plugin, "newaddress", true);
+        }
+
+        @Override
+        void run(CommandContext context) {
+            this.plugin.newAddress();
         }
     }
 
@@ -138,7 +164,9 @@ final class E4hCommand extends AbstractPlayerCommand {
             }
 
             context.sendMessage(state);
-            if (status == null) return;
+            if (status == null) {
+                return;
+            }
 
             context.sendMessage(StatusText.relay(this.plugin.relay(), status));
             context.sendMessage(StatusText.playersCaption(status));

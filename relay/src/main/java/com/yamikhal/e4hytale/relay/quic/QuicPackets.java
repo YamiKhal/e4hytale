@@ -38,7 +38,9 @@ public final class QuicPackets {
 
     // the version of a long header packet, 0 for a version negotiation packet, -1 for a short header or garbage
     public static long version(ByteBuffer datagram) {
-        if (!isLongHeader(datagram) || datagram.remaining() < 5) return -1;
+        if (!isLongHeader(datagram) || datagram.remaining() < 5) {
+            return -1;
+        }
 
         return Integer.toUnsignedLong(datagram.getInt(datagram.position() + 1));
     }
@@ -54,7 +56,9 @@ public final class QuicPackets {
             try {
                 ByteBuffer packet = ByteBuffer.wrap(bytes, offset, bytes.length - offset);
                 int first = Byte.toUnsignedInt(packet.get());
-                if (packet.getInt() != InitialKeys.VERSION_1) break;
+                if (packet.getInt() != InitialKeys.VERSION_1) {
+                    break;
+                }
 
                 byte[] dcid = readCid(packet);
                 byte[] scid = readCid(packet);
@@ -67,11 +71,15 @@ public final class QuicPackets {
                 int length = Math.toIntExact(readVarint(packet));
                 int pnOffset = packet.position();
                 int end = pnOffset + length;
-                if (end > bytes.length || length < 4 + SAMPLE_LENGTH) break;
+                if (end > bytes.length || length < 4 + SAMPLE_LENGTH) {
+                    break;
+                }
 
                 if (type == TYPE_INITIAL) {
                     Initial initial = open(bytes, offset, pnOffset, end, dcid, scid, keysFor.apply(dcid));
-                    if (initial == null) break;
+                    if (initial == null) {
+                        break;
+                    }
 
                     opened.add(initial);
                 }
@@ -116,7 +124,9 @@ public final class QuicPackets {
                         long offset = readVarint(in);
                         byte[] data = new byte[Math.toIntExact(readVarint(in))];
                         in.get(data);
-                        if (!stream.add(offset, data)) return false;
+                        if (!stream.add(offset, data)) {
+                            return false;
+                        }
                     }
                     case 0x1c -> {
                         readVarint(in);
@@ -139,7 +149,9 @@ public final class QuicPackets {
     // null for anything else
     @Nullable
     public static byte[] longHeaderScid(ByteBuffer datagram) {
-        if (!isLongHeader(datagram)) return null;
+        if (!isLongHeader(datagram)) {
+            return null;
+        }
 
         try {
             ByteBuffer packet = datagram.duplicate();
@@ -155,7 +167,9 @@ public final class QuicPackets {
     // the destination connection id of a short header packet, if it is at least `length` bytes long
     @Nullable
     public static byte[] shortHeaderDcid(ByteBuffer datagram, int length) {
-        if (isLongHeader(datagram) || datagram.remaining() < 1 + length) return null;
+        if (isLongHeader(datagram) || datagram.remaining() < 1 + length) {
+            return null;
+        }
 
         byte[] dcid = new byte[length];
         datagram.get(datagram.position() + 1, dcid);
@@ -266,7 +280,9 @@ public final class QuicPackets {
 
     private static byte[] readCid(ByteBuffer packet) {
         int length = Byte.toUnsignedInt(packet.get());
-        if (length > MAX_CID_LENGTH) throw new IllegalArgumentException("Connection id too long");
+        if (length > MAX_CID_LENGTH) {
+            throw new IllegalArgumentException("Connection id too long");
+        }
 
         byte[] cid = new byte[length];
         packet.get(cid);

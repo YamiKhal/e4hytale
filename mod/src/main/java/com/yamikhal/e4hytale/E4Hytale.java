@@ -14,6 +14,8 @@ import com.hypixel.hytale.server.core.plugin.JavaPluginInit;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
 import com.hypixel.hytale.server.core.universe.Universe;
 import com.hypixel.hytale.server.core.util.Config;
+import com.yamikhal.e4hytale.E4HytaleConfig.StartMode;
+import com.yamikhal.e4hytale.tunnel.HostIdentity;
 import com.yamikhal.e4hytale.tunnel.TunnelClient;
 
 import javax.annotation.Nonnull;
@@ -25,7 +27,6 @@ import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
-import java.security.SecureRandom;
 import java.util.HexFormat;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -33,8 +34,8 @@ import java.util.logging.Level;
 
 // e4hytale: shares a hosted world (or a dedicated server) through a public relay, so friends can join with Direct
 // Connect without any port forwarding. The tunnel goes out from here (see TunnelClient), joiners show up to the
-// server as 127.0.0.1 connections. In a hosted world it follows the world's access setting: opening the world to
-// friends starts sharing, setting it back to private stops it. One tunnel per server process
+// server as loopback connections. In a hosted world it follows the world's access setting as the config's Start mode
+// says, and setting the world back to private always stops it. One tunnel per server process
 public final class E4Hytale extends JavaPlugin {
 
     // tries to find the game port after boot, the listeners bind asynchronously
@@ -44,6 +45,8 @@ public final class E4Hytale extends JavaPlugin {
     private final Object lock = new Object();
     @Nullable
     private TunnelClient tunnel;
+    @Nullable
+    private HostIdentity identity;
 
     public E4Hytale(@Nonnull JavaPluginInit init) {
         super(init);
@@ -55,21 +58,27 @@ public final class E4Hytale extends JavaPlugin {
         if (Constants.SINGLEPLAYER) {
             this.getEventRegistry().register(SingleplayerRequestAccessEvent.class, this::onAccessRequested);
         } else {
-            this.getEventRegistry().register(BootEvent.class, event -> {
-                if (this.config.get().isAutoStart()) this.startWhenBound(BIND_ATTEMPTS);
-            });
+            this.getEventRegistry().register(BootEvent.class, event -> this.onBoot());
         }
     }
 
     @Override
     protected void start() {
         E4HytaleConfig config = this.config.get();
-        if (config.hostKey().isEmpty()) {
-            byte[] key = new byte[32];
-            new SecureRandom().nextBytes(key);
-            config.setHostKey(HexFormat.of().formatHex(key));
+        byte[] seed = null;
+        try {
+            seed = HexFormat.of().parseHex(config.hostKey());
+        } catch (IllegalArgumentException e) {
+            this.getLogger().at(Level.WARNING).log("HostKey in config.json is not hex, making a new one");
+        }
+
+        if (seed == null || seed.length != HostIdentity.SEED_LENGTH) {
+            seed = HostIdentity.newSeed();
+            config.setHostKey(HexFormat.of().formatHex(seed));
             this.config.save();
         }
+
+        this.identity = HostIdentity.fromSeed(seed);
     }
 
     @Override
@@ -86,25 +95,17 @@ public final class E4Hytale extends JavaPlugin {
             }
 
             InetSocketAddress target = gameAddress();
-            if (target == null) {
+            if (target == null || this.identity == null) {
                 this.tell(Message.translation("e4hytale.noListener"));
                 return false;
             }
 
             E4HytaleConfig config = this.config.get();
-            byte[] key;
-            try {
-                key = HexFormat.of().parseHex(config.hostKey());
-            } catch (IllegalArgumentException e) {
-                this.tell(Message.translation("e4hytale.startFailed").param("reason", "HostKey in config.json is not hex"));
-                return false;
-            }
-
-            TunnelClient tunnel = new TunnelClient(config.relay(), config.relayPort(), key,
+            TunnelClient tunnel = new TunnelClient(config.relay(), config.relayPort(), this.identity,
                     "e4hytale/" + this.getManifest().getVersion(), target, new Events());
             try {
                 tunnel.start();
-            } catch (IOException | IllegalArgumentException e) {
+            } catch (IOException e) {
                 this.getLogger().at(Level.WARNING).withCause(e).log("Could not start the tunnel");
                 this.tell(Message.translation("e4hytale.startFailed").param("reason", String.valueOf(e.getMessage())));
                 return false;
@@ -120,15 +121,43 @@ public final class E4Hytale extends JavaPlugin {
     // stops sharing, false if it wasn't running. Players who joined through the relay lose their connection
     public boolean stopTunnel(boolean announce) {
         synchronized (this.lock) {
-            if (this.tunnel == null) return false;
+            if (this.tunnel == null) {
+                return false;
+            }
 
             this.tunnel.stop();
             this.tunnel = null;
         }
 
-        if (announce) this.tell(Message.translation("e4hytale.stopped"));
+        if (announce) {
+            this.tell(Message.translation("e4hytale.stopped"));
+        }
 
         return true;
+    }
+
+    // switches to a fresh key, so the relay assigns a new address. A running tunnel retires the old name on the way
+    // out (see TunnelClient#stop(boolean)) and reconnects with the new key. Friends need the new address afterwards
+    public void newAddress() {
+        boolean restart;
+        synchronized (this.lock) {
+            restart = this.tunnel != null;
+            if (this.tunnel != null) {
+                this.tunnel.stop(true);
+                this.tunnel = null;
+            }
+
+            byte[] seed = HostIdentity.newSeed();
+            this.config.get().setHostKey(HexFormat.of().formatHex(seed));
+            this.config.save();
+            this.identity = HostIdentity.fromSeed(seed);
+        }
+
+        this.getLogger().at(Level.INFO).log("Switched to a new host key, the relay will assign a new address");
+        this.tell(Message.translation(restart ? "e4hytale.newAddress" : "e4hytale.newAddressLater"));
+        if (restart) {
+            this.startTunnel();
+        }
     }
 
     @Nullable
@@ -140,20 +169,83 @@ public final class E4Hytale extends JavaPlugin {
         return this.config.get().relay();
     }
 
-    // who may run /e4h: the owner of a hosted world, or anyone with the command's permission on a dedicated server
+    public StartMode startMode() {
+        return this.config.get().start();
+    }
+
+    // saved right away, for a hosted world into that world's config
+    public void setStartMode(StartMode mode) {
+        this.config.get().setStart(mode);
+        this.config.save();
+    }
+
+    // who may control e4hytale: the owner of a hosted world, or anyone with the command's permission on a dedicated
+    // server
     public boolean mayControl(@Nullable UUID player, boolean hasPermission) {
-        if (Constants.SINGLEPLAYER) return player != null && SingleplayerModule.isOwner(player);
+        if (Constants.SINGLEPLAYER) {
+            return player != null && SingleplayerModule.isOwner(player);
+        }
 
         return hasPermission;
     }
 
-    private void onAccessRequested(SingleplayerRequestAccessEvent event) {
-        if (!this.config.get().isAutoStart()) return;
+    // the player whose connection comes from this local port, i.e. who joined through that peer link (the server
+    // sees every joiner as <loopback>:<port of its link>). Null while the joiner is still logging in
+    @Nullable
+    PlayerRef playerAt(int localPort) {
+        Universe universe = Universe.get();
+        if (universe == null || localPort == 0) {
+            return null;
+        }
 
+        for (PlayerRef player : universe.getPlayers()) {
+            if (player.getPacketHandler().getChannel().remoteAddress() instanceof InetSocketAddress remote
+                    && remote.getAddress().isLoopbackAddress() && remote.getPort() == localPort) {
+                return player;
+            }
+        }
+
+        return null;
+    }
+
+    // messages go to the world's owner in a hosted world, a dedicated server has the log
+    void tell(Message message) {
+        if (!Constants.SINGLEPLAYER) {
+            return;
+        }
+
+        Universe universe = Universe.get();
+        PlayerRef owner = universe == null ? null : universe.getPlayer(SingleplayerModule.getUuid());
+        if (owner != null) {
+            owner.sendMessage(message);
+        }
+    }
+
+    // the server can't tell whether friends reach a world without help: the game's own NAT traversal runs in the
+    // owner's client and a failed join never reaches the server. So Ask only suggests e4hytale, it doesn't decide
+    private void onAccessRequested(SingleplayerRequestAccessEvent event) {
         if (event.getAccess() == Access.Private) {
             this.stopTunnel(true);
-        } else if (this.tunnel == null) {
-            this.startTunnel();
+            return;
+        }
+
+        if (this.tunnel != null) {
+            return;
+        }
+
+        switch (this.startMode()) {
+            case ALWAYS -> this.startTunnel();
+            case ASK -> this.tell(Message.translation("e4hytale.suggest"));
+            case MANUAL -> {}
+        }
+    }
+
+    private void onBoot() {
+        switch (this.startMode()) {
+            case ALWAYS -> this.startWhenBound(BIND_ATTEMPTS);
+            case ASK -> this.getLogger().at(Level.INFO).log("Run /e4h start to share this server through the relay "
+                    + "%s, or set Start to Always in the e4hytale config", this.relay());
+            case MANUAL -> {}
         }
     }
 
@@ -167,38 +259,14 @@ public final class E4Hytale extends JavaPlugin {
         HytaleServer.SCHEDULED_EXECUTOR.schedule(() -> this.startWhenBound(attemptsLeft - 1), 1, TimeUnit.SECONDS);
     }
 
-    // the player whose connection comes from this local port, i.e. who joined through that peer link (the server
-    // sees every joiner as 127.0.0.1:<port of its link>). Null while the joiner is still logging in
-    @Nullable
-    PlayerRef playerAt(int localPort) {
-        Universe universe = Universe.get();
-        if (universe == null || localPort == 0) return null;
-
-        for (PlayerRef player : universe.getPlayers()) {
-            if (player.getPacketHandler().getChannel().remoteAddress() instanceof InetSocketAddress remote
-                    && remote.getAddress().isLoopbackAddress() && remote.getPort() == localPort) {
-                return player;
-            }
-        }
-
-        return null;
-    }
-
-    // messages go to the world's owner in a hosted world and to the log on a dedicated server
-    void tell(Message message) {
-        if (Constants.SINGLEPLAYER) {
-            Universe universe = Universe.get();
-            PlayerRef owner = universe == null ? null : universe.getPlayer(SingleplayerModule.getUuid());
-            if (owner != null) owner.sendMessage(message);
-        }
-    }
-
-    // where joiners' datagrams go: the game port on loopback. IPv4 first, a socket bound to one specific address is
+    // where joiners' datagrams go: the game port on loopback, IPv4 first. A socket bound to one specific address is
     // used as it is
     @Nullable
     static InetSocketAddress gameAddress() {
         ServerManager manager = ServerManager.get();
-        if (manager == null) return null;
+        if (manager == null) {
+            return null;
+        }
 
         InetSocketAddress fallback = null;
         for (ServerListener listener : manager.getListeners()) {
@@ -206,7 +274,9 @@ public final class E4Hytale extends JavaPlugin {
 
             InetAddress address = local.getAddress();
             boolean usable = address.isLoopbackAddress() || address.isAnyLocalAddress();
-            if (usable && address instanceof Inet4Address) return new InetSocketAddress(loopback(4), local.getPort());
+            if (usable && address instanceof Inet4Address) {
+                return new InetSocketAddress(loopback(4), local.getPort());
+            }
 
             if (usable && address instanceof Inet6Address && fallback == null) {
                 fallback = new InetSocketAddress(loopback(16), local.getPort());

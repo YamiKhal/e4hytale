@@ -23,7 +23,8 @@ public final class Relay {
             return;
         }
 
-        NameRegistry registry = new NameRegistry(config.dataDirectory().resolve("names.tsv"), config.nameExpiry());
+        NameRegistry registry = new NameRegistry(config.dataDirectory().resolve("names.tsv"), config.nameExpiry(),
+                config.maxNames());
         registry.load(Instant.now());
 
         Metrics metrics = new Metrics();
@@ -31,13 +32,17 @@ public final class Relay {
         StatusServer status = config.httpPort() > 0
                 ? new StatusServer(config.httpPort(), metrics, server, System.getenv("E4H_ADMIN_TOKEN"))
                 : null;
-        if (status != null) status.start();
+        if (status != null) {
+            status.start();
+        }
 
         Thread loop = Thread.ofPlatform().name("e4hytale-relay").start(server::run);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             LOGGER.log(System.Logger.Level.INFO, "Shutting down");
             server.stop();
-            if (status != null) status.stop();
+            if (status != null) {
+                status.stop();
+            }
 
             try {
                 loop.join(5_000);

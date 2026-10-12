@@ -1,6 +1,8 @@
 package com.yamikhal.e4hytale.tunnel;
 
 import java.io.IOException;
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.StandardProtocolFamily;
 import java.nio.ByteBuffer;
@@ -9,7 +11,7 @@ import java.nio.channels.DatagramChannel;
 import java.util.concurrent.atomic.AtomicLong;
 
 // the local end of one joiner: a UDP socket connected to the game server, so the server sees the joiner as
-// 127.0.0.1:<this socket's port>. Datagrams from the relay go out through it, the server's answers come back on a
+// <loopback>:<this socket's port>. Datagrams from the relay go out through it, the server's answers come back on a
 // virtual thread and go into the tunnel. Created and closed by TunnelClient
 final class PeerLink {
 
@@ -22,21 +24,33 @@ final class PeerLink {
     private final AtomicLong bytesOut = new AtomicLong();
     private final AtomicLong dropped = new AtomicLong();
     private final long opened = System.nanoTime();
+    private final int localPort;
+
     private volatile long lastActive = this.opened;
-    private volatile InetSocketAddress address;
+    // where the joiner connects from as the relay sees it, the unspecified address until the relay said
+    private volatile InetSocketAddress address = new InetSocketAddress(0);
     // bytes per second, smoothed over a few seconds (see sample)
     private volatile double rateIn;
     private volatile double rateOut;
     private long sampledIn;
     private long sampledOut;
 
-    PeerLink(TunnelClient client, int peer, InetSocketAddress target, InetSocketAddress address) throws IOException {
+    // binds to the loopback address when the server listens there, so nothing outside this machine reaches the socket
+    PeerLink(TunnelClient client, int peer, InetSocketAddress target) throws IOException {
         this.client = client;
         this.peer = peer;
-        this.address = address;
-        this.channel = DatagramChannel.open(target.getAddress().getAddress().length == 4
-                ? StandardProtocolFamily.INET : StandardProtocolFamily.INET6);
-        this.channel.connect(target);
+        boolean ipv4 = target.getAddress() instanceof Inet4Address;
+        this.channel = DatagramChannel.open(ipv4 ? StandardProtocolFamily.INET : StandardProtocolFamily.INET6);
+        try {
+            InetAddress local = target.getAddress().isLoopbackAddress() ? target.getAddress() : null;
+            this.channel.bind(new InetSocketAddress(local, 0));
+            this.channel.connect(target);
+            this.localPort = ((InetSocketAddress) this.channel.getLocalAddress()).getPort();
+        } catch (IOException e) {
+            this.channel.close();
+            throw e;
+        }
+
         Thread.ofVirtual().name("e4hytale-peer-" + peer).start(this::receiveLoop);
     }
 
@@ -44,13 +58,16 @@ final class PeerLink {
         return this.peer;
     }
 
-    // where the joiner connects from, as the relay sees it (unresolved 0.0.0.0 until the relay said)
     InetSocketAddress address() {
         return this.address;
     }
 
     void setAddress(InetSocketAddress address) {
         this.address = address;
+    }
+
+    int localPort() {
+        return this.localPort;
     }
 
     long bytesIn() {
@@ -82,7 +99,7 @@ final class PeerLink {
         return this.rateOut;
     }
 
-    // called once a second by the tunnel's timer, the only caller
+    // called once a second by the tunnel's timer, its only caller
     void sample() {
         long in = this.bytesIn.get();
         long out = this.bytesOut.get();
@@ -90,14 +107,6 @@ final class PeerLink {
         this.rateOut = this.rateOut * 0.5 + (out - this.sampledOut) * 0.5;
         this.sampledIn = in;
         this.sampledOut = out;
-    }
-
-    int localPort() {
-        try {
-            return this.channel.getLocalAddress() instanceof InetSocketAddress local ? local.getPort() : 0;
-        } catch (IOException e) {
-            return 0;
-        }
     }
 
     // a datagram from the joiner, handed to the server

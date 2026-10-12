@@ -20,6 +20,10 @@ public record RelayConfig(
         // where the name registry is kept, mount it as a volume so addresses survive redeploys
         Path dataDirectory,
         int maxHosts,
+        // names the registry keeps at once, new hosts are refused beyond it
+        int maxNames,
+        // new names one source address may register per day, so nobody can claim all the good ones
+        int newNamesPerDay,
         int maxHostsPerAddress,
         int maxPeersPerHost,
         // new joiner handshakes per source address and minute
@@ -39,6 +43,8 @@ public record RelayConfig(
                 integer(env, "E4H_HTTP_PORT", 8080),
                 Path.of(env.getOrDefault("E4H_DATA", "data")),
                 integer(env, "E4H_MAX_HOSTS", 500),
+                integer(env, "E4H_MAX_NAMES", 100_000),
+                integer(env, "E4H_NEW_NAMES_PER_DAY", 10),
                 integer(env, "E4H_MAX_HOSTS_PER_ADDRESS", 4),
                 integer(env, "E4H_MAX_PEERS_PER_HOST", 32),
                 integer(env, "E4H_HANDSHAKES_PER_MINUTE", 30),
@@ -50,7 +56,9 @@ public record RelayConfig(
 
     private static int integer(Map<String, String> env, String key, int fallback) {
         String value = env.get(key);
-        if (value == null || value.isBlank()) return fallback;
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
 
         try {
             return Integer.parseInt(value.trim());
