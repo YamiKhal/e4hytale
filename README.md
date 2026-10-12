@@ -35,7 +35,6 @@ Only the world's owner can use them. On a dedicated server they need the `yamikh
 - Your address belongs to your world's `HostKey` in `Saves/<world>/mods/YamiKhal_e4hytale/config.json`. Never share
   it.
 - Game traffic stays encrypted end to end. The relay passes it along and can't read it.
-- Works on dedicated servers too: set `Start` to `Always` in the config, or run `/e4h start`.
 
 ## Running your own relay
 
