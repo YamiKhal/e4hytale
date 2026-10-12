@@ -1,0 +1,27 @@
+# e4hytale relay for Coolify (Build Pack: Docker Compose, Base Directory: / of this folder, compose file: this one).
+# UDP can't go through Coolify's proxy, so the ports are published straight from the container: open 5520/udp and
+# 5521/udp in the Hetzner firewall. Only /health and /metrics are HTTP.
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: relay/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "5520:5520/udp"
+      - "5521:5521/udp"
+    expose:
+      - "8080"
+    environment:
+      - E4H_DOMAIN=${E4H_DOMAIN:-e4h.yamikhal.com}
+      - E4H_MAX_HOSTS=${E4H_MAX_HOSTS:-500}
+      - E4H_MAX_PEERS_PER_HOST=${E4H_MAX_PEERS_PER_HOST:-32}
+      # set in Coolify to enable POST /broadcast (sends a message to every host)
+      - E4H_ADMIN_TOKEN=${E4H_ADMIN_TOKEN:-}
+    volumes:
+      # the name registry: keeps every host's address across redeploys
+      - e4h-data:/data
+    stop_grace_period: 10s
+
+volumes:
+  e4h-data:
