@@ -1,6 +1,12 @@
 $C = "../Common.ui";
 $Sounds = "../Sounds.ui";
 
+// one line never scrolls, but a CodeEditor draws its scrollbar anyway
+@NoScrollbar = ScrollbarStyle(
+  Spacing: 0,
+  Size: 0
+);
+
 @Caption = Label {
   Anchor: (Bottom: 6, Horizontal: 4);
   Style: (...$C.@DefaultLabelStyle, FontSize: 13, TextColor: #96a9be, RenderUppercase: true);
@@ -45,10 +51,9 @@ $C.@PageOverlay {
           CodeEditor #Address {
             FlexWeight: 1;
             Style: (TextColor: #ffffff, FontSize: 16);
-            // small enough that one line fits the row, a taller line makes the editor scroll (and show a scrollbar)
             ContentPadding: 6;
             IsReadOnly: true;
-            ScrollbarStyle: $C.@DefaultScrollbarStyle;
+            ScrollbarStyle: @NoScrollbar;
           }
         }
 
