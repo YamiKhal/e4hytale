@@ -14,8 +14,6 @@ import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.storage.EntityStore;
 import com.yamikhal.e4hytale.tunnel.TunnelClient;
 
-import javax.annotation.Nonnull;
-
 // /e4h opens the e4hytale panel, /e4h start | stop | status | copy do the same from chat or the server console.
 // Open to everyone at the command level because a hosted world's owner usually has no permissions in survival, the
 // real check is E4Hytale#mayControl
@@ -35,8 +33,8 @@ final class E4hCommand extends AbstractPlayerCommand {
     }
 
     @Override
-    protected void execute(@Nonnull CommandContext context, @Nonnull Store<EntityStore> store, @Nonnull Ref<EntityStore> ref,
-                           @Nonnull PlayerRef playerRef, @Nonnull World world) {
+    protected void execute(CommandContext context, Store<EntityStore> store, Ref<EntityStore> ref,
+                           PlayerRef playerRef, World world) {
         if (!mayControl(this.plugin, context)) {
             return;
         }
@@ -79,7 +77,7 @@ final class E4hCommand extends AbstractPlayerCommand {
         }
 
         @Override
-        protected void executeSync(@Nonnull CommandContext context) {
+        protected void executeSync(CommandContext context) {
             if (mayControl(this.plugin, context)) {
                 this.run(context);
             }

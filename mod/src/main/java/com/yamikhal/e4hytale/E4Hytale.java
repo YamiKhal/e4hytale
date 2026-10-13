@@ -18,7 +18,6 @@ import com.yamikhal.e4hytale.E4HytaleConfig.StartMode;
 import com.yamikhal.e4hytale.tunnel.HostIdentity;
 import com.yamikhal.e4hytale.tunnel.TunnelClient;
 
-import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
@@ -48,7 +47,7 @@ public final class E4Hytale extends JavaPlugin {
     @Nullable
     private HostIdentity identity;
 
-    public E4Hytale(@Nonnull JavaPluginInit init) {
+    public E4Hytale(JavaPluginInit init) {
         super(init);
     }
 

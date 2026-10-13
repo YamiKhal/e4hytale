@@ -22,7 +22,6 @@ import com.hypixel.hytale.server.core.universe.world.storage.EntityStore;
 import com.yamikhal.e4hytale.E4HytaleConfig.StartMode;
 import com.yamikhal.e4hytale.tunnel.TunnelClient;
 
-import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import java.util.List;
@@ -59,8 +58,7 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
     }
 
     @Override
-    public void build(@Nonnull Ref<EntityStore> ref, @Nonnull UICommandBuilder commands, @Nonnull UIEventBuilder events,
-                      @Nonnull Store<EntityStore> store) {
+    public void build(Ref<EntityStore> ref, UICommandBuilder commands, UIEventBuilder events, Store<EntityStore> store) {
         commands.append("Pages/E4Hytale.ui");
         commands.set("#CopyButton.Visible", Constants.SINGLEPLAYER);
         this.shownAddress = null;
@@ -82,7 +80,7 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
     }
 
     @Override
-    public void handleDataEvent(@Nonnull Ref<EntityStore> ref, @Nonnull Store<EntityStore> store, @Nonnull PageEvent data) {
+    public void handleDataEvent(Ref<EntityStore> ref, Store<EntityStore> store, PageEvent data) {
         // checked again on every press, the permission may be gone since the panel opened
         UUID player = this.playerRef.getUuid();
         boolean permitted = PermissionsModule.get().hasPermission(player, E4hCommand.permission(this.plugin));
@@ -113,7 +111,7 @@ final class E4hPage extends InteractiveCustomUIPage<E4hPage.PageEvent> {
     }
 
     @Override
-    public void onDismiss(@Nonnull Ref<EntityStore> ref, @Nonnull Store<EntityStore> store) {
+    public void onDismiss(Ref<EntityStore> ref, Store<EntityStore> store) {
         this.stopRefreshing();
     }
 
